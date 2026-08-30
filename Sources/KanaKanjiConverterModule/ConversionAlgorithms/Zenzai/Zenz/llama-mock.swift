@@ -40,9 +40,11 @@ package func llama_model_get_vocab(_: llama_model) -> llama_vocab? { unimplement
 
 package func llama_model_load_from_file(_: String, _: llama_model_params) -> llama_model? { unimplemented() }
 
-package func llama_kv_cache_seq_rm(_: llama_context, _: llama_seq_id, _: llama_pos, _: llama_pos) {}
-package func llama_kv_cache_seq_cp(_: llama_context, _: llama_seq_id, _: llama_seq_id, _: llama_pos, _: llama_pos) {}
-package func llama_kv_cache_seq_pos_max(_: llama_context, _: llama_seq_id) -> Int { unimplemented() }
+package typealias llama_memory_t = OpaquePointer
+package func llama_get_memory(_: llama_context) -> llama_memory_t? { unimplemented() }
+package func llama_memory_seq_rm(_: llama_memory_t?, _: llama_seq_id, _: llama_pos, _: llama_pos) {}
+package func llama_memory_seq_cp(_: llama_memory_t?, _: llama_seq_id, _: llama_seq_id, _: llama_pos, _: llama_pos) {}
+package func llama_memory_seq_pos_max(_: llama_memory_t?, _: llama_seq_id) -> Int { unimplemented() }
 
 package struct llama_batch {
     package var token: [llama_token]

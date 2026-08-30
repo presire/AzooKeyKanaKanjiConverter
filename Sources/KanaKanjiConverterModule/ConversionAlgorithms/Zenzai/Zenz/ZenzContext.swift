@@ -480,8 +480,8 @@ final class ZenzContext {
             if otherPrefix > currentPrefix {
                 let copiedPrefixCount = min(otherPrefix, logits_start_index)
                 if copiedPrefixCount > 0 {
-                    llama_kv_cache_seq_rm(context, seqId, 0, -1)
-                    llama_kv_cache_seq_cp(context, otherSeqId, seqId, 0, llama_pos(copiedPrefixCount))
+                    llama_memory_seq_rm(llama_get_memory(context), seqId, 0, -1)
+                    llama_memory_seq_cp(llama_get_memory(context), otherSeqId, seqId, 0, llama_pos(copiedPrefixCount))
                     effectivePrevInput = otherPrevInput
                 }
             }
@@ -490,14 +490,14 @@ final class ZenzContext {
         // Manage KV cache: remove entries that differ from previous input
         let prefixCacheCount: Int
         do {
-            let pos_max = llama_kv_cache_seq_pos_max(self.context, seqId)
+            let pos_max = llama_memory_seq_pos_max(llama_get_memory(self.context), seqId)
             debug("pos max:", pos_max, "prevInput count:", effectivePrevInput.count, "tokens count:", tokens.count)
             let commonTokens = effectivePrevInput.commonPrefix(with: tokens)
             // Remove KV cache from position commonTokens.count onwards to recompute divergent part
             // removed range: [llama_pos(commonTokens.count), inf)
             prefixCacheCount = min(commonTokens.count, logits_start_index)
-            llama_kv_cache_seq_rm(context, seqId, llama_pos(prefixCacheCount), -1)
-            debug("new pos max:", llama_kv_cache_seq_pos_max(self.context, seqId), "commonTokens:", commonTokens.count)
+            llama_memory_seq_rm(llama_get_memory(context), seqId, llama_pos(prefixCacheCount), -1)
+            debug("new pos max:", llama_memory_seq_pos_max(llama_get_memory(self.context), seqId), "commonTokens:", commonTokens.count)
         }
         self.batch.n_tokens = 0
         let n_ctx = llama_n_ctx(context)
