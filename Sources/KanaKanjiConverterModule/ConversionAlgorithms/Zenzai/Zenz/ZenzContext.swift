@@ -10,6 +10,36 @@ import Algorithms
 import Foundation
 import SwiftUtils
 
+// [hazkey-community patch] zenzai inference timer (ZenzInferencePerf)
+public final class ZenzInferencePerf: @unchecked Sendable {
+    public static let shared = ZenzInferencePerf()
+
+    private let lock = NSLock()
+    private var elapsedNanoseconds: UInt64 = 0
+    public let enabled: Bool
+
+    private init() {
+        let perfEvidence = ProcessInfo.processInfo.environment["HAZKEY_PERF_EVIDENCE"]
+        self.enabled = perfEvidence?.isEmpty == false
+    }
+
+    func record(_ nanoseconds: UInt64) {
+        guard enabled else { return }
+        lock.lock()
+        elapsedNanoseconds &+= nanoseconds
+        lock.unlock()
+    }
+
+    public func consumeElapsedNanoseconds() -> UInt64 {
+        guard enabled else { return 0 }
+        lock.lock()
+        defer { lock.unlock() }
+        let elapsed = elapsedNanoseconds
+        elapsedNanoseconds = 0
+        return elapsed
+    }
+}
+
 public typealias ZenzaiDeviceConfig = ConvertRequestOptions.ZenzaiMode.DeviceConfig
 
 public struct GGMLBackendDevice: Sendable {
@@ -129,11 +159,74 @@ enum ZenzError: LocalizedError {
 /// コンテキストより先に解放される可能性があるプロセス終了時の明示解放は行わない。
 private enum ZenzBackend {
     private static let initialized: Void = {
+        // Mitigate SIGILL crash on multi-GPU Linux systems where multiple
+        // Vulkan ICDs (e.g. nvidia_icd.json + radeon_icd.json) coexist.
+        // Ref: https://github.com/7ka-Hiira/hazkey/issues/29
+        // Pin to a single ICD *before* ggml_backend_load_all() runs, because
+        // once the Vulkan loader creates a VkInstance it initializes every
+        // available ICD and the resulting vendor-mixed state triggers a Swift
+        // runtime precondition failure (ud2 -> SIGILL) that cannot be caught
+        // by Swift do/catch.
+        Self.pinVulkanICDIfNeeded()
+
         llama_backend_init()
     }()
 
     static func initializeIfNeeded() {
         _ = self.initialized
+    }
+
+    /// Detect Vulkan ICDs in standard search paths and, when more than one is
+    /// installed, restrict the Vulkan loader to the first detected ICD by
+    /// exporting `VK_DRIVER_FILES` / `VK_ICD_FILENAMES`.
+    ///
+    /// This is a workaround for https://github.com/7ka-Hiira/hazkey/issues/29
+    /// where multi-GPU systems (e.g. NVIDIA dGPU + AMD/Intel iGPU) with both
+    /// `nvidia_icd.json` and `radeon_icd.json` installed crash hazkey-server
+    /// with SIGILL during Zenzai / Vulkan initialization.
+    ///
+    /// User-provided values for `VK_DRIVER_FILES` / `VK_ICD_FILENAMES` (set
+    /// via shell, systemd unit, or `~/.config/hazkey/env`) are always respected
+    /// and never overridden.
+    ///
+    /// Notes:
+    /// - Only intervenes when 2+ ICDs are detected; single-ICD systems are
+    ///   not affected by Issue #29 and are left untouched.
+    /// - Must be called *before* any ggml backend / Vulkan API call.
+    private static func pinVulkanICDIfNeeded() {
+        let env = ProcessInfo.processInfo.environment
+        if env["VK_DRIVER_FILES"] != nil { return }
+        if env["VK_ICD_FILENAMES"] != nil { return }
+
+        var icdSearchPaths = [
+            "/usr/share/vulkan/icd.d",
+            "/usr/local/share/vulkan/icd.d",
+            "/etc/vulkan/icd.d",
+        ]
+        // Honor XDG_DATA_DIRS when set (typical on Arch / Fedora / Debian).
+        if let xdg = env["XDG_DATA_DIRS"] {
+            for entry in xdg.split(separator: ":") {
+                icdSearchPaths.append("\(entry)/vulkan/icd.d")
+            }
+        }
+
+        let fm = FileManager.default
+        var foundICDs: [String] = []
+        for searchPath in icdSearchPaths {
+            guard let candidates = try? fm.contentsOfDirectory(atPath: searchPath) else { continue }
+            for candidate in candidates where candidate.hasSuffix(".json") {
+                foundICDs.append("\(searchPath)/\(candidate)")
+            }
+        }
+
+        // Only intervene when more than one ICD is present; single-ICD
+        // systems are not affected by Issue #29.
+        guard foundICDs.count > 1 else { return }
+
+        let pinned = foundICDs[0]
+        debug("[Vulkan ICD] Multi-ICD environment detected: \(foundICDs). Pinning to \(pinned) to avoid SIGILL (Issue #29).")
+        setenv("VK_DRIVER_FILES", pinned, 1)
+        setenv("VK_ICD_FILENAMES", pinned, 1)
     }
 }
 
@@ -594,6 +687,13 @@ final class ZenzContext {
     }
 
     private func getLogits(tokens: [llama_token], logits_start_index: Int = 0, seqId: llama_seq_id = 0) -> UnsafeMutablePointer<Float>? {
+        let perfStart = ZenzInferencePerf.shared.enabled ? DispatchTime.now().uptimeNanoseconds : 0
+        defer {
+            if perfStart != 0 {
+                ZenzInferencePerf.shared.record(DispatchTime.now().uptimeNanoseconds - perfStart)
+            }
+        }
+
         let currentPrevInput = self.prevInputBySeq[seqId] ?? []
         var effectivePrevInput = currentPrevInput
 
