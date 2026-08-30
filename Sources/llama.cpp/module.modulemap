@@ -3,8 +3,12 @@ module llama [system] {
     header "ggml.h"
     header "ggml-alloc.h"
     header "ggml-backend.h"
+    header "ggml-cpu.h"
+    header "ggml-opt.h"
 
     link "llama"
+    link "ggml"
+    link "ggml-base"
 
     export *
 }
