@@ -230,12 +230,25 @@ public struct ConvertRequestOptions: Sendable {
             var baseNgramLanguageModel: String
             var personalNgramLanguageModel: String
         }
+
+        /// Device configuration for Zenzai backend
+        public struct DeviceConfig: Sendable, Equatable {
+            public init(deviceName: String? = nil, gpuLayers: Int32 = 0) {
+                self.deviceName = deviceName
+                self.gpuLayers = gpuLayers
+            }
+
+            public var deviceName: String?
+            public var gpuLayers: Int32
+        }
+
         public static let off = ZenzaiMode(
             enabled: false,
             weightURL: URL(fileURLWithPath: ""),
             inferenceLimit: 10,
             requestRichCandidates: false,
-            versionDependentMode: .v3(.init())
+            versionDependentMode: .v3(.init()),
+            deviceConfig: DeviceConfig()
         )
 
         /// activate *Zenzai* - Neural Kana-Kanji Conversiion Engine
@@ -245,14 +258,16 @@ public struct ConvertRequestOptions: Sendable {
         ///    - requestRichCandidates: when this flag is true, the converter spends more time but generate richer N-Best candidates for candidate list view. Usually this option is not recommended for live conversion.
         ///    - personalizationMode: values for personalization.
         ///    - versionDependentMode: specify zenz model version and its configuration.
-        public static func on(weight: URL, inferenceLimit: Int = 10, requestRichCandidates: Bool = false, personalizationMode: PersonalizationMode?, versionDependentMode: ZenzaiVersionDependentMode = .v3(.init())) -> Self {
+        ///    - deviceConfig: configuration for GGML backend device (GPU layers, device selection).
+        public static func on(weight: URL, inferenceLimit: Int = 10, requestRichCandidates: Bool = false, personalizationMode: PersonalizationMode?, versionDependentMode: ZenzaiVersionDependentMode = .v3(.init()), deviceConfig: DeviceConfig = DeviceConfig()) -> Self {
             ZenzaiMode(
                 enabled: true,
                 weightURL: weight,
                 inferenceLimit: inferenceLimit,
                 requestRichCandidates: requestRichCandidates,
                 personalizationMode: personalizationMode,
-                versionDependentMode: versionDependentMode
+                versionDependentMode: versionDependentMode,
+                deviceConfig: deviceConfig
             )
         }
         var enabled: Bool
@@ -261,5 +276,6 @@ public struct ConvertRequestOptions: Sendable {
         var requestRichCandidates: Bool
         var personalizationMode: PersonalizationMode?
         var versionDependentMode: ZenzaiVersionDependentMode
+        var deviceConfig: DeviceConfig
     }
 }

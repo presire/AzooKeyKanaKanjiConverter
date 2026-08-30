@@ -10,6 +10,105 @@ import Algorithms
 import Foundation
 import SwiftUtils
 
+public typealias ZenzaiDeviceConfig = ConvertRequestOptions.ZenzaiMode.DeviceConfig
+
+public struct GGMLBackendDevice: Sendable {
+    public let name: String
+    public let description: String
+    public let type: DeviceType
+
+    public enum DeviceType: Sendable {
+        case cpu
+        case gpu
+        case accel
+        case unknown
+    }
+
+    #if Zenzai
+    init(device: ggml_backend_dev_t) {
+        if let namePtr = ggml_backend_dev_name(device) {
+            self.name = String(cString: namePtr)
+        } else {
+            self.name = "Unknown"
+        }
+
+        if let descPtr = ggml_backend_dev_description(device) {
+            self.description = String(cString: descPtr)
+        } else {
+            self.description = "Unknown"
+        }
+
+        switch ggml_backend_dev_type(device) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:
+            self.type = .cpu
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+            self.type = .gpu
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+            self.type = .accel
+        default:
+            self.type = .unknown
+        }
+    }
+    #endif
+}
+
+/// Enumerate available GGML backend devices.
+/// Call `loadGGMLBackends()` once before using this function.
+public func enumerateGGMLBackendDevices() -> [GGMLBackendDevice] {
+    #if Zenzai
+    let deviceCount = ggml_backend_dev_count()
+    var devices: [GGMLBackendDevice] = []
+    for i in 0..<deviceCount {
+        if let device = ggml_backend_dev_get(i) {
+            devices.append(GGMLBackendDevice(device: device))
+        }
+    }
+    return devices
+    #else
+    return []
+    #endif
+}
+
+/// Load all available GGML backends.
+/// - Parameter path: An optional directory from which to load backends.
+public func loadGGMLBackends(from path: String? = nil) {
+    #if Zenzai
+    if let path {
+        ggml_backend_load_all_from_path(path)
+    } else {
+        ggml_backend_load_all()
+    }
+    #endif
+}
+
+/// Create a device configuration with `createDeviceConfig` based on available backend devices.
+public func createDeviceConfig(
+    deviceName: String? = nil,
+    gpuLayers: Int32 = 99
+) -> ZenzaiDeviceConfig {
+    #if Zenzai
+    let devices = enumerateGGMLBackendDevices()
+
+    if let targetName = deviceName,
+       let device = devices.first(where: { $0.name == targetName }) {
+        switch device.type {
+        case .gpu:
+            return ZenzaiDeviceConfig(deviceName: targetName, gpuLayers: gpuLayers)
+        case .cpu, .accel, .unknown:
+            return ZenzaiDeviceConfig(deviceName: targetName, gpuLayers: 0)
+        }
+    }
+
+    if let cpuDevice = devices.first(where: { $0.type == .cpu }) {
+        return ZenzaiDeviceConfig(deviceName: cpuDevice.name, gpuLayers: 0)
+    }
+
+    return ZenzaiDeviceConfig(deviceName: nil, gpuLayers: 0)
+    #else
+    return ZenzaiDeviceConfig(deviceName: nil, gpuLayers: 0)
+    #endif
+}
+
 enum ZenzError: LocalizedError {
     case couldNotLoadModel(path: String)
     case couldNotLoadContext
@@ -270,11 +369,24 @@ final class ZenzaiMemoizationCache: @unchecked Sendable {
 /// KV cacheなどの可変状態は`ZenzContext`側に残し、モデルの重みとvocabularyだけを
 /// 共有することで、同じモデルを利用するConverterごとの再ロードを避ける。
 private final class SharedZenzModel {
-    init(path: String) throws {
+    init(path: String, deviceConfig: ZenzaiDeviceConfig) throws {
         ZenzBackend.initializeIfNeeded()
         var modelParams = llama_model_default_params()
         modelParams.use_mmap = true
-        #if ZenzaiCPU
+        #if Zenzai
+        modelParams.n_gpu_layers = deviceConfig.gpuLayers
+        let loadedModel: OpaquePointer?
+        if let deviceName = deviceConfig.deviceName,
+           let device = ggml_backend_dev_by_name(deviceName) {
+            var devices = [device, nil]
+            loadedModel = devices.withUnsafeMutableBufferPointer { buffer in
+                modelParams.devices = buffer.baseAddress
+                return llama_model_load_from_file(path, modelParams)
+            }
+        } else {
+            loadedModel = llama_model_load_from_file(path, modelParams)
+        }
+        #elseif ZenzaiCPU
         modelParams.n_gpu_layers = 0
         modelParams.split_mode = LLAMA_SPLIT_MODE_NONE
         guard let cpuDevice = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) else {
@@ -323,13 +435,13 @@ private final class SharedZenzModelCache: @unchecked Sendable {
         self.cache.countLimit = 1
     }
 
-    func model(path: String) throws -> SharedZenzModel {
+    func model(path: String, deviceConfig: ZenzaiDeviceConfig) throws -> SharedZenzModel {
         try self.lock.withLock {
             let key = path as NSString
             if let cached = self.cache.object(forKey: key) {
                 return cached
             }
-            let model = try SharedZenzModel(path: path)
+            let model = try SharedZenzModel(path: path, deviceConfig: deviceConfig)
             self.cache.setObject(model, forKey: key)
             return model
         }
@@ -345,15 +457,21 @@ final class ZenzContext {
     private var batch: llama_batch
     private var prevInputBySeq: [llama_seq_id: [llama_token]] = [:]
     private var prevPromptBySeq: [llama_seq_id: String] = [:]
+    private var currentDeviceConfig: ZenzaiDeviceConfig
 
     private let n_len: Int32 = 512
     private let evalSeqId: llama_seq_id = 0
     private let inputPredictionSeqId: llama_seq_id = 1
 
-    private init(sharedModel: SharedZenzModel, context: OpaquePointer) {
+    private init(
+        sharedModel: SharedZenzModel,
+        context: OpaquePointer,
+        deviceConfig: ZenzaiDeviceConfig
+    ) {
         self.sharedModel = sharedModel
         self.context = context
         self.batch = llama_batch_init(512, 0, 1)
+        self.currentDeviceConfig = deviceConfig
     }
 
     deinit {
@@ -361,17 +479,20 @@ final class ZenzContext {
         llama_free(context)
     }
 
-    private static var ctx_params: llama_context_params {
+    private static func ctx_params(deviceConfig: ZenzaiDeviceConfig) -> llama_context_params {
         let n_threads = self.inferenceThreadCount
         debug("Using \(n_threads) threads")
         var ctx_params = llama_context_default_params()
         ctx_params.n_ctx = 512
-        ctx_params.flash_attn = true
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
         ctx_params.n_threads       = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
         ctx_params.n_batch = 512
         #if Zenzai || ZenzaiCPU
         ctx_params.n_ubatch = 64
+        #endif
+        #if Zenzai
+        ctx_params.offload_kqv = deviceConfig.gpuLayers > 0
         #endif
         // 推論時間は呼び出し側で計測する。llama.cpp内部の統計更新は不要。
         ctx_params.no_perf = true
@@ -430,9 +551,15 @@ final class ZenzContext {
     }
     #endif
 
-    static func createContext(path: String) throws -> ZenzContext {
-        let sharedModel = try SharedZenzModelCache.shared.model(path: path)
-        var params = ctx_params
+    static func createContext(
+        path: String,
+        deviceConfig: ZenzaiDeviceConfig = ZenzaiDeviceConfig()
+    ) throws -> ZenzContext {
+        let sharedModel = try SharedZenzModelCache.shared.model(
+            path: path,
+            deviceConfig: deviceConfig
+        )
+        var params = ctx_params(deviceConfig: deviceConfig)
         #if ZenzaiCPU
         // CPU 専用: KV / KQV 等の GPU オフロードを完全に無効化
         params.offload_kqv = false
@@ -443,12 +570,16 @@ final class ZenzContext {
             throw ZenzError.couldNotLoadContext
         }
 
-        return ZenzContext(sharedModel: sharedModel, context: context)
+        return ZenzContext(
+            sharedModel: sharedModel,
+            context: context,
+            deviceConfig: deviceConfig
+        )
     }
 
     func resetContext() throws {
         llama_free(self.context)
-        var params = Self.ctx_params
+        var params = Self.ctx_params(deviceConfig: self.currentDeviceConfig)
         #if ZenzaiCPU
         params.offload_kqv = false
         #endif

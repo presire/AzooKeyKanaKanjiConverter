@@ -14,9 +14,11 @@ package struct llama_context_params {
     package var n_threads: Int32
     package var n_threads_batch: Int32
     package var n_batch: Int
-    package var flash_attn: Bool
+    package var flash_attn_type: llama_flash_attn_type
     package var no_perf: Bool
 }
+package typealias llama_flash_attn_type = Int32
+package let LLAMA_FLASH_ATTN_TYPE_ENABLED: llama_flash_attn_type = 1
 package func llama_context_default_params() -> llama_context_params { unimplemented() }
 
 package typealias llama_context = OpaquePointer
