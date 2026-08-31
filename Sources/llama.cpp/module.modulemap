@@ -5,6 +5,7 @@ module llama [system] {
     header "ggml-backend.h"
     header "ggml-cpu.h"
     header "ggml-opt.h"
+    header "gguf.h"
 
     link "llama"
     link "ggml"
