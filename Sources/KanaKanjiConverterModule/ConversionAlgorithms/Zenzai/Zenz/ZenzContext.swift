@@ -465,7 +465,6 @@ private final class SharedZenzModel {
     init(path: String, deviceConfig: ZenzaiDeviceConfig) throws {
         ZenzBackend.initializeIfNeeded()
         var modelParams = llama_model_default_params()
-        modelParams.use_mmap = true
         #if Zenzai
         modelParams.n_gpu_layers = deviceConfig.gpuLayers
         let loadedModel: OpaquePointer?
