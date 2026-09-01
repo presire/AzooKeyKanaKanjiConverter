@@ -7,10 +7,16 @@ import SwiftUtils
 
 struct ZenzPureGreedyDecoder {
     static func decode(context: ZenzContext, leftSideContext: String, maxCount: Int = .max) -> String {
+        // [hazkey-community patch] opt-in Zenzai CPU latency deadline (HAZKEY_ZENZAI_DEADLINE_MS)
+        ZenzInferencePerf.shared.beginDeadlineWindow()
         var promptTokens = context.encodeRaw(leftSideContext, addBOS: false)
         let initialCount = promptTokens.count
         let vocabSize = Int(context.vocabSize)
         while promptTokens.count - initialCount < maxCount {
+            if ZenzInferencePerf.shared.deadlineExpired() {
+                debug("HAZKEY_ZENZAI_DEADLINE_MS exceeded in pure greedy decode")
+                break
+            }
             let startOffset = promptTokens.count - 1
             guard let logits = context.evaluationLogits(tokens: promptTokens, startOffset: startOffset) else {
                 debug("logits unavailable")

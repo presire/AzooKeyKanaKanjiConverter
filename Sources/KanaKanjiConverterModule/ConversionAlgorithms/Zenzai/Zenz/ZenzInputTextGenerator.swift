@@ -27,6 +27,8 @@ struct ZenzInputTextGenerator {
         ) else {
             return ""
         }
+        // [hazkey-community patch] opt-in Zenzai CPU latency deadline (HAZKEY_ZENZAI_DEADLINE_MS)
+        ZenzInferencePerf.shared.beginDeadlineWindow()
         let allowedPrefixes: [String] = possibleNexts.filter { !$0.isEmpty }
 
         @inline(__always)
@@ -49,6 +51,10 @@ struct ZenzInputTextGenerator {
         var predictedText = ""
 
         for _ in 0..<count {
+            if ZenzInferencePerf.shared.deadlineExpired() {
+                debug("HAZKEY_ZENZAI_DEADLINE_MS exceeded in input text generation")
+                break
+            }
             let startOffset = promptTokens.count - 1
             guard let logits = context.inputPredictionLogits(tokens: promptTokens, startOffset: startOffset) else {
                 debug("logits unavailable")

@@ -132,6 +132,8 @@ extension Kana2Kanji {
         versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
         dicdataStoreState: DicdataStoreState
     ) -> (result: LatticeNode, lattice: Lattice, cache: ZenzaiCache) {
+        // [hazkey-community patch] opt-in Zenzai CPU latency deadline (HAZKEY_ZENZAI_DEADLINE_MS)
+        ZenzInferencePerf.shared.beginDeadlineWindow()
         let latticeInputData = Self.zenzaiLatticeInputData(for: inputData)
         let zenzInputCursorPosition = Self.zenzaiInputCursorPosition(for: inputData)
         let inputStyle = inputData.input.last?.inputStyle ?? .direct
@@ -334,6 +336,13 @@ extension Kana2Kanji {
                 if inferenceLimit == 0 {
                     debug("inference limit! \(candidate.text) is used for excuse")
                     // When inference occurs more than maximum times, then just return result at this point
+                    return (eosNode, lattice, makeCache(constraint: constraint, satisfyingCandidate: candidate))
+                }
+                // [hazkey-community patch] opt-in Zenzai CPU latency deadline
+                // (HAZKEY_ZENZAI_DEADLINE_MS): on expiry, fall back to non-neural candidates
+                // using the same early-return shape as the inferenceLimit==0 branch above.
+                if ZenzInferencePerf.shared.deadlineExpired() {
+                    debug("HAZKEY_ZENZAI_DEADLINE_MS exceeded! \(candidate.text) is used for excuse")
                     return (eosNode, lattice, makeCache(constraint: constraint, satisfyingCandidate: candidate))
                 }
                 if defersEvaluationForPendingInput {

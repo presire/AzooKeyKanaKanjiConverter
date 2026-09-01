@@ -18,9 +18,29 @@ public final class ZenzInferencePerf: @unchecked Sendable {
     private var elapsedNanoseconds: UInt64 = 0
     public let enabled: Bool
 
+    // [hazkey-community patch] opt-in Zenzai CPU latency deadline (HAZKEY_ZENZAI_DEADLINE_MS).
+    // Reuses this class's single monotonic clock source (DispatchTime.now().uptimeNanoseconds)
+    // instead of introducing a second, independent timer. Unlike `elapsedNanoseconds` (an
+    // accumulator gated by `enabled`, consumed once per evidence report), the deadline tracks
+    // elapsed wall-clock time since the most recent `beginDeadlineWindow()` call and is always
+    // active when a valid deadline is configured, independent of the `HAZKEY_PERF_EVIDENCE` flag.
+    public let deadlineNanoseconds: UInt64?
+    private var deadlineWindowStart: UInt64?
+
     private init() {
         let perfEvidence = ProcessInfo.processInfo.environment["HAZKEY_PERF_EVIDENCE"]
         self.enabled = perfEvidence?.isEmpty == false
+        self.deadlineNanoseconds = Self.parseDeadlineMilliseconds(
+            ProcessInfo.processInfo.environment["HAZKEY_ZENZAI_DEADLINE_MS"]
+        )
+    }
+
+    private static func parseDeadlineMilliseconds(_ raw: String?) -> UInt64? {
+        // 未設定・0・範囲外・非数値は全て「デッドライン無効」として扱う（トラップしない）。
+        guard let raw, let value = Int(raw), value >= 1, value <= 2_000 else {
+            return nil
+        }
+        return UInt64(value) * 1_000_000
     }
 
     func record(_ nanoseconds: UInt64) {
@@ -37,6 +57,27 @@ public final class ZenzInferencePerf: @unchecked Sendable {
         let elapsed = elapsedNanoseconds
         elapsedNanoseconds = 0
         return elapsed
+    }
+
+    /// デッドライン監視ウィンドウを開始する（`HAZKEY_ZENZAI_DEADLINE_MS` 未設定時は no-op）。
+    /// Zenzai推論を行う独立したエントリポイント（`all_zenzai`、`ZenzPureGreedyDecoder.decode`、
+    /// `ZenzInputTextGenerator.generate`）それぞれの先頭で呼び出す想定。
+    public func beginDeadlineWindow() {
+        guard deadlineNanoseconds != nil else { return }
+        lock.lock()
+        deadlineWindowStart = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+    }
+
+    /// 現在のデッドラインウィンドウが期限切れかどうかを返す。デッドライン未設定、または
+    /// ウィンドウ未開始の場合は常に false（既存の動作を変えない）。
+    public func deadlineExpired() -> Bool {
+        guard let deadlineNanoseconds else { return false }
+        lock.lock()
+        let start = deadlineWindowStart
+        lock.unlock()
+        guard let start else { return false }
+        return DispatchTime.now().uptimeNanoseconds &- start >= deadlineNanoseconds
     }
 }
 
@@ -597,6 +638,17 @@ final class ZenzContext {
     /// 増えるため、最高性能クラスタの物理コア数を利用する。それ以外の環境では
     /// OSへ応答性の余地を残しつつ、llama.cppの小規模モデルで過剰並列にならない
     /// よう8スレッドを上限とする。
+    // [hazkey-community patch] opt-in CPU thread budget override (HAZKEY_ZENZAI_CPU_THREADS).
+    // Invalid values (absent, non-numeric, 0, negative, or > 8) fall back to the existing
+    // activeProcessorCount-derived behavior unchanged — never crashes, never traps.
+    private static let cpuThreadCountOverride: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["HAZKEY_ZENZAI_CPU_THREADS"],
+              let value = Int(raw), value >= 1, value <= 8 else {
+            return nil
+        }
+        return value
+    }()
+
     private static var inferenceThreadCount: Int {
         let activeProcessorCount = max(1, ProcessInfo.processInfo.activeProcessorCount)
         #if canImport(Darwin)
@@ -604,10 +656,15 @@ final class ZenzContext {
         #else
         let performanceCoreCount: Int? = nil
         #endif
-        return self.selectInferenceThreadCount(
+        let selected = self.selectInferenceThreadCount(
             activeProcessorCount: activeProcessorCount,
             performanceCoreCount: performanceCoreCount
         )
+        if let override = self.cpuThreadCountOverride {
+            debug("HAZKEY_ZENZAI_CPU_THREADS override: using \(override) threads (default would be \(selected))")
+            return override
+        }
+        return selected
     }
 
     /// DarwinではmacOS/iOSともに最高性能クラスタを優先し、sysctl値を取得できない
