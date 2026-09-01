@@ -588,9 +588,9 @@ private final class SharedZenzModelCache: @unchecked Sendable {
 final class ZenzContext {
     #if Zenzai || ZenzaiCPU
     private struct CPUThreadPoolState: Sendable {
-        private var threadPool: OpaquePointer?
-        private var threadCount: Int32?
-        private var leaseCount = 0
+        var threadPoolAddress: UInt?
+        var threadCount: Int32?
+        var leaseCount = 0
     }
 
     private final class CPUThreadPoolStore: Sendable {
@@ -598,7 +598,8 @@ final class ZenzContext {
 
         func acquire(threadCount: Int32) -> OpaquePointer? {
             state.withLock { state in
-                if let threadPool = state.threadPool {
+                if let threadPoolAddress = state.threadPoolAddress,
+                   let threadPool = OpaquePointer(bitPattern: threadPoolAddress) {
                     guard state.threadCount == threadCount else {
                         return nil
                     }
@@ -610,7 +611,7 @@ final class ZenzContext {
                     return nil
                 }
 
-                state.threadPool = threadPool
+                state.threadPoolAddress = UInt(bitPattern: threadPool)
                 state.threadCount = threadCount
                 state.leaseCount = 1
                 NSLog("ZenzContext CPU ggml threadpool created (threads: \(threadCount))")
@@ -620,7 +621,7 @@ final class ZenzContext {
 
         func release(_ threadPool: OpaquePointer) {
             state.withLock { state in
-                guard state.threadPool == threadPool, state.leaseCount > 0 else {
+                guard state.threadPoolAddress == UInt(bitPattern: threadPool), state.leaseCount > 0 else {
                     return
                 }
 
@@ -629,7 +630,7 @@ final class ZenzContext {
                     return
                 }
 
-                state.threadPool = nil
+                state.threadPoolAddress = nil
                 state.threadCount = nil
                 llama_cpu_threadpool_free(threadPool)
                 NSLog("ZenzContext CPU ggml threadpool released")
