@@ -684,7 +684,6 @@ public final class KanaKanjiConverter {
                 N_best: 5,
                 dicdataStoreState: self.dicdataStoreState
             )
-            print(fullClause.text, predictions)
             candidates.append(contentsOf: consume predictions)
         }
         if !candidates.isEmpty {
