@@ -503,7 +503,10 @@ final class ZenzaiMemoizationCache: @unchecked Sendable {
 ///
 /// KV cacheなどの可変状態は`ZenzContext`側に残し、モデルの重みとvocabularyだけを
 /// 共有することで、同じモデルを利用するConverterごとの再ロードを避ける。
-private final class SharedZenzModel {
+///
+/// アクセスレベルはテスト容易性のためfileprivateからinternalへ緩和している
+/// (publicではない = モジュール外からは引き続き不可視)。
+final class SharedZenzModel {
     init(path: String, deviceConfig: ZenzaiDeviceConfig) throws {
         ZenzBackend.initializeIfNeeded()
         var modelParams = llama_model_default_params()
@@ -562,23 +565,41 @@ private final class SharedZenzModel {
 ///
 /// `NSCache`にすることでメモリプレッシャー時にはモデルを解放できる。呼び出し側の
 /// `ZenzContext`もモデルを強参照するため、使用中のモデルが解放されることはない。
-private final class SharedZenzModelCache: @unchecked Sendable {
+///
+/// キャッシュキーは `path` と `deviceConfig` の両方から構成する。`path`のみをキーにすると、
+/// 同じモデルファイルをCPU/GPUなど異なるデバイス構成で読み込もうとした際に、先に読み込まれた
+/// デバイス構成のモデルが誤って再利用されてしまう (例: GPU構成での要求がCPU構成のキャッシュ
+/// ヒットを起こし、GPUへのオフロードが一切行われない)。
+///
+/// アクセスレベルはテスト容易性のためfileprivateからinternalへ緩和している
+/// (publicではない = モジュール外からは引き続き不可視)。
+final class SharedZenzModelCache: @unchecked Sendable {
     static let shared = SharedZenzModelCache()
 
     private init() {
         self.cache.countLimit = 1
     }
 
+    /// テスト用の注入ポイント。本番コードは常に`SharedZenzModel.init`をデフォルト値として使用し、
+    /// 実際のllama.cppモデルロードを行う。`@testable import`したテストターゲットのみが、
+    /// 実モデル・GPU無しでdeviceConfigの伝播や重複防止ロジックを検証するために上書きしてよい。
+    /// テスト側は使用後に必ずデフォルト値へ復元すること。
+    nonisolated(unsafe) static var modelConstructor: (String, ZenzaiDeviceConfig) throws -> SharedZenzModel = SharedZenzModel.init
+
     func model(path: String, deviceConfig: ZenzaiDeviceConfig) throws -> SharedZenzModel {
         try self.lock.withLock {
-            let key = path as NSString
+            let key = Self.cacheKey(path: path, deviceConfig: deviceConfig) as NSString
             if let cached = self.cache.object(forKey: key) {
                 return cached
             }
-            let model = try SharedZenzModel(path: path, deviceConfig: deviceConfig)
+            let model = try Self.modelConstructor(path, deviceConfig)
             self.cache.setObject(model, forKey: key)
             return model
         }
+    }
+
+    static func cacheKey(path: String, deviceConfig: ZenzaiDeviceConfig) -> String {
+        "\(path)#\(deviceConfig.deviceName ?? "")#\(deviceConfig.gpuLayers)"
     }
 
     private let cache = NSCache<NSString, SharedZenzModel>()

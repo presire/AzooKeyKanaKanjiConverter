@@ -258,13 +258,20 @@ public final class KanaKanjiConverter {
         return uniqueStableCandidates + additionalCandidates
     }
 
-    package func getModel(modelURL: URL) -> Zenz? {
-        if let model = self.zenz, model.resourceURL == modelURL {
+    /// - Parameters:
+    ///   - modelURL: Zenzaiモデルの重みファイルパス。
+    ///   - deviceConfig: GGMLバックエンドデバイス構成 (GPUオフロード層数・デバイス名)。
+    ///     `ConvertRequestOptions.ZenzaiMode.deviceConfig`から伝播する。CPU/GPUなど異なる構成が
+    ///     要求された場合、インスタンスキャッシュ (`self.zenz`) も共有キャッシュ
+    ///     (`SharedZenzCache` / `SharedZenzModelCache`) も再利用してはならない
+    ///     (`Zenz.canReuse` 参照)。
+    package func getModel(modelURL: URL, deviceConfig: ZenzaiDeviceConfig = ZenzaiDeviceConfig()) -> Zenz? {
+        if let model = self.zenz, Zenz.canReuse(cachedURL: model.resourceURL, cachedDeviceConfig: model.deviceConfig, requestedURL: modelURL, requestedDeviceConfig: deviceConfig) {
             self.zenzStatus = "load \(modelURL.absoluteString)"
             return model
         } else {
             do {
-                self.zenz = try Zenz.shared(resourceURL: modelURL)
+                self.zenz = try Zenz.shared(resourceURL: modelURL, deviceConfig: deviceConfig)
                 self.purgeZenzaiMemoizationCache()
                 self.sessions = self.sessions.mapValues { state in
                     let next = state
@@ -313,7 +320,7 @@ public final class KanaKanjiConverter {
         ) {
             return cachedPrediction
         }
-        guard let zenz = self.getModel(modelURL: options.zenzaiMode.weightURL) else {
+        guard let zenz = self.getModel(modelURL: options.zenzaiMode.weightURL, deviceConfig: options.zenzaiMode.deviceConfig) else {
             self.invalidatePredictiveInputCache()
             print("zenz-v3 model unavailable")
             return ("", 0)
@@ -362,7 +369,7 @@ public final class KanaKanjiConverter {
                 debug("zenz mode is disabled")
                 return []
             }
-            guard let zenz = self.getModel(modelURL: options.zenzaiMode.weightURL) else {
+            guard let zenz = self.getModel(modelURL: options.zenzaiMode.weightURL, deviceConfig: options.zenzaiMode.deviceConfig) else {
                 debug("zenz model unavailable")
                 return []
             }
@@ -1096,7 +1103,7 @@ public final class KanaKanjiConverter {
         }
 
         // FIXME: enable cache based zenzai
-        if zenzaiMode.enabled, let model = self.getModel(modelURL: zenzaiMode.weightURL) {
+        if zenzaiMode.enabled, let model = self.getModel(modelURL: zenzaiMode.weightURL, deviceConfig: zenzaiMode.deviceConfig) {
             let (result, nodes, cache) = self.converter.all_zenzai(
                 inputData,
                 zenz: model,
