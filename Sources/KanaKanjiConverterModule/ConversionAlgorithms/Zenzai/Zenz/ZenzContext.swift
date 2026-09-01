@@ -8,6 +8,7 @@ import Darwin
 
 import Algorithms
 import Foundation
+import Synchronization
 import SwiftUtils
 
 // [hazkey-community patch] zenzai inference timer (ZenzInferencePerf)
@@ -586,52 +587,53 @@ private final class SharedZenzModelCache: @unchecked Sendable {
 
 final class ZenzContext {
     #if Zenzai || ZenzaiCPU
-    private final class CPUThreadPoolStore {
-        private let lock = NSLock()
+    private struct CPUThreadPoolState: Sendable {
         private var threadPool: OpaquePointer?
         private var threadCount: Int32?
         private var leaseCount = 0
+    }
+
+    private final class CPUThreadPoolStore: Sendable {
+        private let state = Mutex(CPUThreadPoolState())
 
         func acquire(threadCount: Int32) -> OpaquePointer? {
-            lock.lock()
-            defer { lock.unlock() }
+            state.withLock { state in
+                if let threadPool = state.threadPool {
+                    guard state.threadCount == threadCount else {
+                        return nil
+                    }
+                    state.leaseCount += 1
+                    return threadPool
+                }
 
-            if let threadPool {
-                guard self.threadCount == threadCount else {
+                guard let threadPool = llama_cpu_threadpool_create(threadCount) else {
                     return nil
                 }
-                leaseCount += 1
+
+                state.threadPool = threadPool
+                state.threadCount = threadCount
+                state.leaseCount = 1
+                NSLog("ZenzContext CPU ggml threadpool created (threads: \(threadCount))")
                 return threadPool
             }
-
-            guard let threadPool = llama_cpu_threadpool_create(threadCount) else {
-                return nil
-            }
-
-            self.threadPool = threadPool
-            self.threadCount = threadCount
-            self.leaseCount = 1
-            NSLog("ZenzContext CPU ggml threadpool created (threads: \(threadCount))")
-            return threadPool
         }
 
         func release(_ threadPool: OpaquePointer) {
-            lock.lock()
-            defer { lock.unlock() }
+            state.withLock { state in
+                guard state.threadPool == threadPool, state.leaseCount > 0 else {
+                    return
+                }
 
-            guard self.threadPool == threadPool, leaseCount > 0 else {
-                return
+                state.leaseCount -= 1
+                guard state.leaseCount == 0 else {
+                    return
+                }
+
+                state.threadPool = nil
+                state.threadCount = nil
+                llama_cpu_threadpool_free(threadPool)
+                NSLog("ZenzContext CPU ggml threadpool released")
             }
-
-            leaseCount -= 1
-            guard leaseCount == 0 else {
-                return
-            }
-
-            self.threadPool = nil
-            self.threadCount = nil
-            llama_cpu_threadpool_free(threadPool)
-            NSLog("ZenzContext CPU ggml threadpool released")
         }
     }
 
