@@ -486,6 +486,13 @@ extern "C" {
     //optional:
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
+    // Create a CPU threadpool for use with llama_attach_threadpool().
+    // The pool has non-spinning idle workers (poll = 0). The caller owns the
+    // returned pool and must detach it from every context before freeing it.
+    // Returns NULL when the CPU backend or its threadpool API is unavailable.
+    LLAMA_API ggml_threadpool_t llama_cpu_threadpool_create(int32_t n_threads);
+    LLAMA_API void               llama_cpu_threadpool_free  (ggml_threadpool_t threadpool);
+
     // Optional: an auto threadpool gets created in ggml if not passed explicitly
     LLAMA_API void llama_attach_threadpool(
             struct llama_context * ctx,

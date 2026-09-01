@@ -585,12 +585,67 @@ private final class SharedZenzModelCache: @unchecked Sendable {
 }
 
 final class ZenzContext {
+    #if Zenzai || ZenzaiCPU
+    private final class CPUThreadPoolStore {
+        private let lock = NSLock()
+        private var threadPool: OpaquePointer?
+        private var threadCount: Int32?
+        private var leaseCount = 0
+
+        func acquire(threadCount: Int32) -> OpaquePointer? {
+            lock.lock()
+            defer { lock.unlock() }
+
+            if let threadPool {
+                guard self.threadCount == threadCount else {
+                    return nil
+                }
+                leaseCount += 1
+                return threadPool
+            }
+
+            guard let threadPool = llama_cpu_threadpool_create(threadCount) else {
+                return nil
+            }
+
+            self.threadPool = threadPool
+            self.threadCount = threadCount
+            self.leaseCount = 1
+            NSLog("ZenzContext CPU ggml threadpool created (threads: \(threadCount))")
+            return threadPool
+        }
+
+        func release(_ threadPool: OpaquePointer) {
+            lock.lock()
+            defer { lock.unlock() }
+
+            guard self.threadPool == threadPool, leaseCount > 0 else {
+                return
+            }
+
+            leaseCount -= 1
+            guard leaseCount == 0 else {
+                return
+            }
+
+            self.threadPool = nil
+            self.threadCount = nil
+            llama_cpu_threadpool_free(threadPool)
+            NSLog("ZenzContext CPU ggml threadpool released")
+        }
+    }
+
+    private static let cpuThreadPoolStore = CPUThreadPoolStore()
+    #endif
+
     private let sharedModel: SharedZenzModel
     private var context: OpaquePointer
     private var batch: llama_batch
     private var prevInputBySeq: [llama_seq_id: [llama_token]] = [:]
     private var prevPromptBySeq: [llama_seq_id: String] = [:]
     private var currentDeviceConfig: ZenzaiDeviceConfig
+    private let cpuThreadPool: OpaquePointer?
+    private let cpuThreadPoolThreadCount: Int32?
 
     private let n_len: Int32 = 512
     private let evalSeqId: llama_seq_id = 0
@@ -599,17 +654,69 @@ final class ZenzContext {
     private init(
         sharedModel: SharedZenzModel,
         context: OpaquePointer,
-        deviceConfig: ZenzaiDeviceConfig
+        deviceConfig: ZenzaiDeviceConfig,
+        cpuThreadPool: OpaquePointer?,
+        cpuThreadPoolThreadCount: Int32?
     ) {
         self.sharedModel = sharedModel
         self.context = context
         self.batch = llama_batch_init(512, 0, 1)
         self.currentDeviceConfig = deviceConfig
+        self.cpuThreadPool = cpuThreadPool
+        self.cpuThreadPoolThreadCount = cpuThreadPoolThreadCount
     }
 
     deinit {
+        Self.detachCPUThreadPool(self.cpuThreadPool, from: self.context)
         llama_batch_free(self.batch)
         llama_free(context)
+        Self.releaseCPUThreadPool(self.cpuThreadPool)
+    }
+
+    private static func acquireCPUThreadPool(
+        deviceConfig: ZenzaiDeviceConfig,
+        threadCount: Int32
+    ) -> OpaquePointer? {
+        #if Zenzai || ZenzaiCPU
+        guard deviceConfig.gpuLayers == 0 else {
+            return nil
+        }
+        return cpuThreadPoolStore.acquire(threadCount: threadCount)
+        #else
+        return nil
+        #endif
+    }
+
+    private static func attachCPUThreadPool(
+        _ threadPool: OpaquePointer?,
+        poolThreadCount: Int32?,
+        contextThreadCount: Int32,
+        to context: OpaquePointer
+    ) {
+        #if Zenzai || ZenzaiCPU
+        guard let threadPool, let poolThreadCount, poolThreadCount == contextThreadCount else {
+            return
+        }
+        llama_attach_threadpool(context, threadPool, threadPool)
+        #endif
+    }
+
+    private static func detachCPUThreadPool(_ threadPool: OpaquePointer?, from context: OpaquePointer) {
+        #if Zenzai || ZenzaiCPU
+        guard threadPool != nil else {
+            return
+        }
+        llama_detach_threadpool(context)
+        #endif
+    }
+
+    private static func releaseCPUThreadPool(_ threadPool: OpaquePointer?) {
+        #if Zenzai || ZenzaiCPU
+        guard let threadPool else {
+            return
+        }
+        cpuThreadPoolStore.release(threadPool)
+        #endif
     }
 
     private static func ctx_params(deviceConfig: ZenzaiDeviceConfig) -> llama_context_params {
@@ -718,15 +825,29 @@ final class ZenzContext {
             debug("Could not load context!")
             throw ZenzError.couldNotLoadContext
         }
+        let cpuThreadPool = Self.acquireCPUThreadPool(
+            deviceConfig: deviceConfig,
+            threadCount: params.n_threads
+        )
+        let cpuThreadPoolThreadCount = cpuThreadPool == nil ? nil : params.n_threads
+        Self.attachCPUThreadPool(
+            cpuThreadPool,
+            poolThreadCount: cpuThreadPoolThreadCount,
+            contextThreadCount: params.n_threads,
+            to: context
+        )
 
         return ZenzContext(
             sharedModel: sharedModel,
             context: context,
-            deviceConfig: deviceConfig
+            deviceConfig: deviceConfig,
+            cpuThreadPool: cpuThreadPool,
+            cpuThreadPoolThreadCount: cpuThreadPoolThreadCount
         )
     }
 
     func resetContext() throws {
+        Self.detachCPUThreadPool(self.cpuThreadPool, from: self.context)
         llama_free(self.context)
         var params = Self.ctx_params(deviceConfig: self.currentDeviceConfig)
         #if ZenzaiCPU
@@ -738,6 +859,12 @@ final class ZenzContext {
             throw ZenzError.couldNotLoadContext
         }
         self.context = context
+        Self.attachCPUThreadPool(
+            self.cpuThreadPool,
+            poolThreadCount: self.cpuThreadPoolThreadCount,
+            contextThreadCount: params.n_threads,
+            to: context
+        )
         self.prevInputBySeq = [:]
         self.prevPromptBySeq = [:]
     }
