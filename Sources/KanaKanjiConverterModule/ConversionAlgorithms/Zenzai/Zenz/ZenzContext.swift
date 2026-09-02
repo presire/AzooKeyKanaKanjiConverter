@@ -89,11 +89,27 @@ public struct GGMLBackendDevice: Sendable {
     public let description: String
     public let type: DeviceType
 
+    /// - Note: `.igpu` (integrated GPU using host memory, e.g. AMD APU / RADV RAPHAEL_MENDOCINO)
+    ///   is a distinct GGML device-type category from `.gpu` (dedicated memory), but is equally
+    ///   capable of receiving offloaded model layers. Both must be treated as GPU-capable in
+    ///   `resolveDeviceConfig` below, or a user who selects a real (integrated) GPU device still
+    ///   gets `gpuLayers = 0` and silent all-CPU placement.
     public enum DeviceType: Sendable {
         case cpu
         case gpu
+        case igpu
         case accel
         case unknown
+    }
+
+    /// Plain memberwise initializer, always available regardless of the Zenzai/ZenzaiCPU trait.
+    /// Lets `resolveDeviceConfig` be regression-tested with synthetic devices, without touching
+    /// llama.cpp/GGML. The Cxx-backed `init(device:)` below remains the only production
+    /// constructor actually reachable from `enumerateGGMLBackendDevices()`.
+    public init(name: String, description: String, type: DeviceType) {
+        self.name = name
+        self.description = description
+        self.type = type
     }
 
     #if Zenzai
@@ -115,6 +131,8 @@ public struct GGMLBackendDevice: Sendable {
             self.type = .cpu
         case GGML_BACKEND_DEVICE_TYPE_GPU:
             self.type = .gpu
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+            self.type = .igpu
         case GGML_BACKEND_DEVICE_TYPE_ACCEL:
             self.type = .accel
         default:
@@ -153,18 +171,20 @@ public func loadGGMLBackends(from path: String? = nil) {
     #endif
 }
 
-/// Create a device configuration with `createDeviceConfig` based on available backend devices.
-public func createDeviceConfig(
-    deviceName: String? = nil,
-    gpuLayers: Int32 = 99
+/// Pure device-selection logic extracted from `createDeviceConfig` for testability: given an
+/// already-enumerated device list, decide the resulting `ZenzaiDeviceConfig` without touching
+/// llama.cpp/GGML. `createDeviceConfig` is the real production entry point and always calls this
+/// with `enumerateGGMLBackendDevices()`; tests call it directly with synthetic `GGMLBackendDevice`
+/// values (including `.igpu`) to regression-test device-type classification.
+func resolveDeviceConfig(
+    deviceName: String?,
+    gpuLayers: Int32,
+    devices: [GGMLBackendDevice]
 ) -> ZenzaiDeviceConfig {
-    #if Zenzai
-    let devices = enumerateGGMLBackendDevices()
-
     if let targetName = deviceName,
        let device = devices.first(where: { $0.name == targetName }) {
         switch device.type {
-        case .gpu:
+        case .gpu, .igpu:
             return ZenzaiDeviceConfig(deviceName: targetName, gpuLayers: gpuLayers)
         case .cpu, .accel, .unknown:
             return ZenzaiDeviceConfig(deviceName: targetName, gpuLayers: 0)
@@ -176,9 +196,14 @@ public func createDeviceConfig(
     }
 
     return ZenzaiDeviceConfig(deviceName: nil, gpuLayers: 0)
-    #else
-    return ZenzaiDeviceConfig(deviceName: nil, gpuLayers: 0)
-    #endif
+}
+
+/// Create a device configuration with `createDeviceConfig` based on available backend devices.
+public func createDeviceConfig(
+    deviceName: String? = nil,
+    gpuLayers: Int32 = 99
+) -> ZenzaiDeviceConfig {
+    resolveDeviceConfig(deviceName: deviceName, gpuLayers: gpuLayers, devices: enumerateGGMLBackendDevices())
 }
 
 enum ZenzError: LocalizedError {
