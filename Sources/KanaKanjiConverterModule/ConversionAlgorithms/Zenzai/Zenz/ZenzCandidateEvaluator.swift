@@ -89,6 +89,55 @@ struct ZenzCandidateEvaluator {
         versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
         memoizationCache: ZenzaiMemoizationCache
     ) -> CandidateEvaluationResult {
+        // 固定された部分は、表記を左文脈に移し、読みを入力から除いて、残りだけを評価する。
+        // モデルは固定された表記が読みを消費したことを知らないので、残したまま評価すると続きの判断がずれる。
+        guard let fixedPrefix = prefixConstraint.fixedPrefix,
+              candidate.text.utf8.count >= fixedPrefix.byteCount,
+              input.count >= fixedPrefix.rubyCount else {
+            return self.evaluateAsIs(
+                context: context,
+                input: input,
+                inputCursorPosition: inputCursorPosition,
+                candidate: candidate,
+                requestRichCandidates: requestRichCandidates,
+                prefixConstraint: prefixConstraint,
+                personalizationMode: personalizationMode,
+                versionDependentConfig: versionDependentConfig,
+                memoizationCache: memoizationCache
+            )
+        }
+        let fixed = Array(prefixConstraint.constraint.prefix(fixedPrefix.byteCount))
+        var remainingCandidate = candidate
+        remainingCandidate.text = String(decoding: candidate.text.utf8.dropFirst(fixedPrefix.byteCount), as: UTF8.self)
+        remainingCandidate.data = self.droppingFixedData(candidate.data, byteCount: fixedPrefix.byteCount)
+        var remainingConstraint = prefixConstraint
+        remainingConstraint.constraint = Array(prefixConstraint.constraint.dropFirst(fixedPrefix.byteCount))
+        remainingConstraint.fixedPrefix = nil
+        let result = self.evaluateAsIs(
+            context: context,
+            input: String(input.dropFirst(fixedPrefix.rubyCount)),
+            inputCursorPosition: inputCursorPosition.map { $0 - fixedPrefix.rubyCount },
+            candidate: remainingCandidate,
+            requestRichCandidates: requestRichCandidates,
+            prefixConstraint: remainingConstraint,
+            personalizationMode: personalizationMode,
+            versionDependentConfig: self.appendingLeftSideContext(String(decoding: fixed, as: UTF8.self), to: versionDependentConfig),
+            memoizationCache: memoizationCache
+        )
+        return self.prepending(fixed, to: result)
+    }
+
+    private static func evaluateAsIs(
+        context: ZenzContext,
+        input: String,
+        inputCursorPosition: Int? = nil,
+        candidate: Candidate,
+        requestRichCandidates: Bool,
+        prefixConstraint: Kana2Kanji.PrefixConstraint,
+        personalizationMode: (mode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode, base: EfficientNGram, personal: EfficientNGram)?,
+        versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
+        memoizationCache: ZenzaiMemoizationCache
+    ) -> CandidateEvaluationResult {
         debug("Evaluate", candidate)
         var userDictionaryPrompt = ""
         for item in candidate.data where item.metadata.contains(.isFromUserDictionary) {
@@ -394,6 +443,51 @@ struct ZenzCandidateEvaluator {
                 return candidateText + ZenzPromptBuilder.alignmentSeparator
             }
             return candidateText
+        }
+    }
+
+    /// `data` の先頭から、表記全体が固定部分に収まる要素だけを落とす
+    static func droppingFixedData(_ data: [DicdataElement], byteCount: Int) -> [DicdataElement] {
+        var coveredByteCount = 0
+        return Array(
+            data.drop { element in
+                let nextCoveredByteCount = coveredByteCount + element.word.utf8.count
+                guard nextCoveredByteCount <= byteCount else {
+                    return false
+                }
+                coveredByteCount = nextCoveredByteCount
+                return true
+            }
+        )
+    }
+
+    private static func appendingLeftSideContext(_ text: String, to config: ConvertRequestOptions.ZenzaiVersionDependentMode) -> ConvertRequestOptions.ZenzaiVersionDependentMode {
+        switch config {
+        case .v2(var mode):
+            mode.leftSideContext = (mode.leftSideContext ?? "") + text
+            return .v2(mode)
+        case .v3(var mode):
+            mode.leftSideContext = (mode.leftSideContext ?? "") + text
+            return .v3(mode)
+        }
+    }
+
+    /// 固定された表記を除いて評価した結果の制約に、その表記を戻す
+    private static func prepending(_ fixed: [UInt8], to result: CandidateEvaluationResult) -> CandidateEvaluationResult {
+        switch result {
+        case .error:
+            return .error
+        case .pass(let score, let alternativeConstraints):
+            return .pass(
+                score: score,
+                alternativeConstraints: alternativeConstraints.map {
+                    .init(probabilityRatio: $0.probabilityRatio, prefixConstraint: fixed + $0.prefixConstraint)
+                }
+            )
+        case .fixRequired(let prefixConstraint):
+            return .fixRequired(prefixConstraint: fixed + prefixConstraint)
+        case .wholeResult(let wholeResult):
+            return .wholeResult(String(decoding: fixed, as: UTF8.self) + wholeResult)
         }
     }
 

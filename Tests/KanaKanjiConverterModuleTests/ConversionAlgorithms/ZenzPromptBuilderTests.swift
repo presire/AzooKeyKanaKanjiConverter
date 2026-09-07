@@ -129,6 +129,55 @@ final class ZenzPromptBuilderTests: XCTestCase {
         XCTAssertEqual(text, "葉\u{EE08}")
     }
 
+    func testDroppingFixedDataKeepsElementCrossingFixedBoundary() {
+        let crossingElement = DicdataElement(
+            word: "←の",
+            ruby: "ヒダリノ",
+            cid: CIDData.一般名詞.cid,
+            mid: MIDData.一般.mid,
+            value: 0,
+            metadata: .isFromUserDictionary
+        )
+        let trailingElement = DicdataElement(
+            word: "候補",
+            ruby: "コウホ",
+            cid: CIDData.一般名詞.cid,
+            mid: MIDData.一般.mid,
+            value: 0
+        )
+
+        let result = ZenzCandidateEvaluator.droppingFixedData(
+            [crossingElement, trailingElement],
+            byteCount: "←".utf8.count
+        )
+
+        XCTAssertEqual(result, [crossingElement, trailingElement])
+    }
+
+    func testDroppingFixedDataDropsElementsCoveredByFixedPrefix() {
+        let fixedElement = DicdataElement(
+            word: "←",
+            ruby: "ヒダリ",
+            cid: CIDData.一般名詞.cid,
+            mid: MIDData.一般.mid,
+            value: 0
+        )
+        let trailingElement = DicdataElement(
+            word: "の",
+            ruby: "ノ",
+            cid: CIDData.一般名詞.cid,
+            mid: MIDData.一般.mid,
+            value: 0
+        )
+
+        let result = ZenzCandidateEvaluator.droppingFixedData(
+            [fixedElement, trailingElement],
+            byteCount: "←".utf8.count
+        )
+
+        XCTAssertEqual(result, [trailingElement])
+    }
+
     func testZenzaiLatticeInputDataUsesPrefixForNonEndCursor() {
         let input = ComposingText(
             convertTargetCursorPosition: 1,

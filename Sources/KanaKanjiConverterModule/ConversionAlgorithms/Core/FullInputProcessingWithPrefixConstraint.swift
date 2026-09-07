@@ -27,6 +27,12 @@ extension Kana2Kanji {
         return (matched, total)
     }
 
+    /// 固定された表記は、学習データやユーザ辞書由来のノードにも制約として掛ける。
+    /// 経路の表記が固定された byte 数に達するまで、制約と一致していることを求める。
+    private func matchesFixedPrefix(matched: Int, total: Int, fixedByteCount: Int) -> Bool {
+        matched >= min(total, fixedByteCount)
+    }
+
     // Extend match with next word starting from current matched index
     private func extendMatched(
         matched: Int,
@@ -109,6 +115,7 @@ extension Kana2Kanji {
         }
         let constraintBytes = constraint.constraint
         let constraintLength = constraintBytes.count
+        let fixedByteCount = constraint.fixedPrefix?.byteCount ?? 0
         let enforcesConstraintOnStaticDictionary = !constraint.ignoreMemoryAndUserDictionary
         // 「i文字目から始まるnodes」に対して
         for (isHead, nodeArray) in lattice.indexedNodes(indices: latticeIndices) {
@@ -142,6 +149,8 @@ extension Kana2Kanji {
                             guard condition else {
                                 continue
                             }
+                        } else if !self.matchesFixedPrefix(matched: matchState.matched, total: matchState.total, fixedByteCount: fixedByteCount) {
+                            continue
                         }
                         let newNode = node.getRegisteredNode(
                             0,
@@ -190,6 +199,16 @@ extension Kana2Kanji {
                             guard isCompatible else {
                                 continue
                             }
+                        } else {
+                            let (matched, _) = self.extendMatched(
+                                matched: matchState.matched,
+                                nextWord: nextNode.data.word,
+                                constraintBytes: constraintBytes
+                            )
+                            let newTotal = matchState.total + nextNode.data.word.utf8.count
+                            guard self.matchesFixedPrefix(matched: matched, total: newTotal, fixedByteCount: fixedByteCount) else {
+                                continue
+                            }
                         }
                         let newNode = node.getRegisteredNode(
                             0,
@@ -235,6 +254,8 @@ extension Kana2Kanji {
                             guard condition else {
                                 continue
                             }
+                        } else if !self.matchesFixedPrefix(matched: mtPerPrev[index].matched, total: mtPerPrev[index].total, fixedByteCount: fixedByteCount) {
+                            continue
                         }
                         let newnode: RegisteredNode = node.getRegisteredNode(
                             index,
@@ -300,6 +321,13 @@ extension Kana2Kanji {
                                         || (newTotal <= constraintLength && matchedExt == newTotal)
                                 }
                                 guard ok else {
+                                    continue
+                                }
+                            } else {
+                                let (matchedPrev, totalPrev) = mtPerPrev[index]
+                                let (matchedExt, _) = self.extendMatched(matched: matchedPrev, nextWord: nextnode.data.word, constraintBytes: constraintBytes)
+                                let newTotal = totalPrev + nextnode.data.word.utf8.count
+                                guard self.matchesFixedPrefix(matched: matchedExt, total: newTotal, fixedByteCount: fixedByteCount) else {
                                     continue
                                 }
                             }

@@ -141,7 +141,7 @@ public enum ComposingCount: Sendable, Equatable {
 }
 
 /// 変換候補のデータ
-public struct Candidate: Sendable {
+public struct Candidate: Sendable, Equatable {
     /// 入力となるテキスト
     public var text: String
     /// 評価値

@@ -10,12 +10,14 @@ extension Kana2Kanji {
             constraint: PrefixConstraint,
             satisfyingCandidate: Candidate?,
             evaluatedSatisfyingCandidate: Candidate? = nil,
+            prefixCandidate: Candidate? = nil,
             lattice: Lattice? = nil
         ) {
             self.inputData = inputData
             self.prefixConstraint = constraint
             self.satisfyingCandidate = satisfyingCandidate
             self.evaluatedSatisfyingCandidate = evaluatedSatisfyingCandidate
+            self.prefixCandidate = prefixCandidate
             self.cachedLattice = lattice
             self.cachedLatticeInputData = lattice == nil ? nil : inputData
         }
@@ -25,6 +27,7 @@ extension Kana2Kanji {
             constraint: PrefixConstraint,
             satisfyingCandidate: Candidate?,
             evaluatedSatisfyingCandidate: Candidate?,
+            prefixCandidate: Candidate?,
             cachedLattice: Lattice?,
             cachedLatticeInputData: ComposingText?
         ) {
@@ -32,6 +35,7 @@ extension Kana2Kanji {
             self.prefixConstraint = constraint
             self.satisfyingCandidate = satisfyingCandidate
             self.evaluatedSatisfyingCandidate = evaluatedSatisfyingCandidate
+            self.prefixCandidate = prefixCandidate
             self.cachedLattice = cachedLattice
             self.cachedLatticeInputData = cachedLatticeInputData
         }
@@ -39,6 +43,8 @@ extension Kana2Kanji {
         private var prefixConstraint: PrefixConstraint
         private var satisfyingCandidate: Candidate?
         private(set) var evaluatedSatisfyingCandidate: Candidate?
+        /// 入力の先頭が決まっている候補。読みが入力の先頭に残っている間、表記を固定部分にする。
+        private(set) var prefixCandidate: Candidate?
         private var inputData: ComposingText
         private var cachedLattice: Lattice?
         private var cachedLatticeInputData: ComposingText?
@@ -55,12 +61,60 @@ extension Kana2Kanji {
                 constraint: constraint,
                 satisfyingCandidate: satisfyingCandidate,
                 evaluatedSatisfyingCandidate: satisfyingCandidate,
+                prefixCandidate: self.prefixCandidate(remainingIn: newInputData),
+                cachedLattice: self.cachedLattice,
+                cachedLatticeInputData: self.cachedLatticeInputData
+            )
+        }
+
+        /// 先頭の候補を設定し、以降の変換で先頭の制約として使う。
+        /// 直近のラティスは差分構築用に保持する。
+        func settingPrefixCandidate(_ candidate: Candidate) -> ZenzaiCache {
+            ZenzaiCache(
+                self.inputData,
+                constraint: self.prefixConstraint,
+                satisfyingCandidate: candidate,
+                evaluatedSatisfyingCandidate: candidate,
+                prefixCandidate: candidate,
                 cachedLattice: self.cachedLattice,
                 cachedLatticeInputData: self.cachedLatticeInputData
             )
         }
 
         func getNewConstraint(for newInputData: ComposingText) -> PrefixConstraint {
+            self.fixingPrefix(self.getReplaceableConstraint(for: newInputData), for: newInputData)
+        }
+
+        /// 先頭の候補の読みが入力の先頭にそのまま残っていればその候補。残っていなければ nil で、以降は引き継がない。
+        func prefixCandidate(remainingIn newInputData: ComposingText) -> Candidate? {
+            guard let prefixCandidate,
+                  newInputData.convertTarget.toKatakana().hasPrefix(prefixCandidate.data.map(\.ruby).joined()) else {
+                return nil
+            }
+            return prefixCandidate
+        }
+
+        /// 先頭の候補の読みが入力の先頭にそのまま残っている間、その表記を固定部分にする。
+        /// 制約が表記で始まっていればその長さを固定し、始まっていなければ表記で置き換える。
+        private func fixingPrefix(_ constraint: PrefixConstraint, for newInputData: ComposingText) -> PrefixConstraint {
+            guard let prefixCandidate = self.prefixCandidate(remainingIn: newInputData) else {
+                return constraint
+            }
+            let fixed = Array(prefixCandidate.data.map(\.word).joined().utf8)
+            let fixedPrefix = PrefixConstraint.FixedPrefix(
+                byteCount: fixed.count,
+                rubyCount: prefixCandidate.data.map(\.ruby).joined().count
+            )
+            if constraint.constraint.hasPrefix(fixed) {
+                var fixedConstraint = constraint
+                fixedConstraint.fixedPrefix = fixedPrefix
+                return fixedConstraint
+            }
+            return PrefixConstraint(fixed, fixedPrefix: fixedPrefix)
+        }
+
+        /// モデルの評価で置き換わりうる制約。
+        private func getReplaceableConstraint(for newInputData: ComposingText) -> PrefixConstraint {
             if let satisfyingCandidate {
                 var current = newInputData.convertTarget.toKatakana()[...]
                 var constraint = [UInt8]()
@@ -101,18 +155,28 @@ extension Kana2Kanji {
     }
 
     struct PrefixConstraint: Sendable, Equatable, Hashable, CustomStringConvertible {
-        init(_ constraint: [UInt8], hasEOS: Bool = false, ignoreMemoryAndUserDictionary: Bool = false) {
+        /// 先頭の決まっている部分。モデルはこの表記を左文脈、この読みを入力済みとして扱い、評価しない。
+        struct FixedPrefix: Sendable, Equatable, Hashable {
+            /// `constraint` の先頭のうち、固定された表記の byte 数
+            var byteCount: Int
+            /// 入力 (カタカナ) の先頭のうち、その表記が読んだ文字数
+            var rubyCount: Int
+        }
+
+        init(_ constraint: [UInt8], hasEOS: Bool = false, ignoreMemoryAndUserDictionary: Bool = false, fixedPrefix: FixedPrefix? = nil) {
             self.constraint = constraint
             self.hasEOS = hasEOS
             self.ignoreMemoryAndUserDictionary = ignoreMemoryAndUserDictionary
+            self.fixedPrefix = fixedPrefix
         }
 
         var constraint: [UInt8]
         var hasEOS: Bool
         var ignoreMemoryAndUserDictionary: Bool
+        var fixedPrefix: FixedPrefix?
 
         var description: String {
-            "PrefixConstraint(constraint: \"\(String(decoding: self.constraint, as: UTF8.self))\", hasEOS: \(self.hasEOS), ignoreMemoryAndUserDictionary: \(self.ignoreMemoryAndUserDictionary))"
+            "PrefixConstraint(constraint: \"\(String(decoding: self.constraint, as: UTF8.self))\", hasEOS: \(self.hasEOS), ignoreMemoryAndUserDictionary: \(self.ignoreMemoryAndUserDictionary), fixedPrefix: \(String(describing: self.fixedPrefix)))"
         }
 
         var isEmpty: Bool {
@@ -144,6 +208,7 @@ extension Kana2Kanji {
                 inputStyle: inputStyle
             ).droppedSuffixCount > 0
         var constraint = zenzaiCache?.getNewConstraint(for: latticeInputData) ?? PrefixConstraint([])
+        let prefixCandidate = zenzaiCache?.prefixCandidate(remainingIn: latticeInputData)
         let resolvedConversionCacheKey: ZenzResolvedConversionCacheKey? =
             if !requestRichCandidates,
                personalizationMode == nil,
@@ -209,6 +274,7 @@ extension Kana2Kanji {
                 constraint: constraint,
                 satisfyingCandidate: satisfyingCandidate,
                 evaluatedSatisfyingCandidate: evaluatedSatisfyingCandidate,
+                prefixCandidate: prefixCandidate,
                 lattice: latticeIsComplete ? lattice : nil
             )
         }
@@ -511,7 +577,8 @@ extension Kana2Kanji {
             let newConstraint = Self.normalizedZenzConstraint(
                 prefixConstraint,
                 defaultHasEOS: false,
-                ignoreMemoryAndUserDictionary: constraint.ignoreMemoryAndUserDictionary
+                ignoreMemoryAndUserDictionary: constraint.ignoreMemoryAndUserDictionary,
+                fixedPrefix: constraint.fixedPrefix
             )
             if constraint == newConstraint {
                 if !constraint.ignoreMemoryAndUserDictionary, candidates[candidateIndex].data.contains(where: { !$0.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary])}) {
@@ -551,7 +618,8 @@ extension Kana2Kanji {
             let newConstraint = Self.normalizedZenzConstraint(
                 Array(wholeConstraint.utf8),
                 defaultHasEOS: true,
-                ignoreMemoryAndUserDictionary: constraint.ignoreMemoryAndUserDictionary
+                ignoreMemoryAndUserDictionary: constraint.ignoreMemoryAndUserDictionary,
+                fixedPrefix: constraint.fixedPrefix
             )
             // 同じ制約が2回連続で出てきたら諦める
             if constraint == newConstraint {
@@ -593,12 +661,14 @@ extension Kana2Kanji {
     static func normalizedZenzConstraint(
         _ constraintBytes: [UInt8],
         defaultHasEOS: Bool,
-        ignoreMemoryAndUserDictionary: Bool
+        ignoreMemoryAndUserDictionary: Bool,
+        fixedPrefix: PrefixConstraint.FixedPrefix? = nil
     ) -> PrefixConstraint {
+        // fixedPrefixの byte 数をそのまま引き継げるのは、ZenzCandidateEvaluator.evaluate が結果の先頭に固定された表記を戻すため
         if let prefix = self.prefixBeforeAlignmentSeparator(in: constraintBytes) {
-            return PrefixConstraint(prefix, hasEOS: true, ignoreMemoryAndUserDictionary: ignoreMemoryAndUserDictionary)
+            return PrefixConstraint(prefix, hasEOS: true, ignoreMemoryAndUserDictionary: ignoreMemoryAndUserDictionary, fixedPrefix: fixedPrefix)
         }
-        return PrefixConstraint(constraintBytes, hasEOS: defaultHasEOS, ignoreMemoryAndUserDictionary: ignoreMemoryAndUserDictionary)
+        return PrefixConstraint(constraintBytes, hasEOS: defaultHasEOS, ignoreMemoryAndUserDictionary: ignoreMemoryAndUserDictionary, fixedPrefix: fixedPrefix)
     }
 
     private static func prefixBeforeAlignmentSeparator(in bytes: [UInt8]) -> [UInt8]? {

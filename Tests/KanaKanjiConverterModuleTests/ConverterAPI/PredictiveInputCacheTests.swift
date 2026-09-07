@@ -14,6 +14,52 @@ final class PredictiveInputCacheTests: XCTestCase {
         )
     }
 
+    func testAcceptPredictionCandidateAppendsRemainingReading() {
+        let converter = KanaKanjiConverter.withoutDictionary()
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("ありが", inputStyle: .direct)
+
+        let accepted = converter.acceptPredictionCandidate(
+            self.makeCandidate(text: "ありがとうございます"),
+            composingText: &composingText
+        )
+
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(composingText.convertTarget, "ありがとうございます")
+    }
+
+    func testAcceptPredictionCandidateReplacesPendingRomanSuffix() {
+        let converter = KanaKanjiConverter.withoutDictionary()
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("arigat", inputStyle: .roman2kana)
+        XCTAssertEqual(composingText.convertTarget, "ありがt")
+
+        let accepted = converter.acceptPredictionCandidate(
+            self.makeCandidate(text: "ありがとう"),
+            composingText: &composingText
+        )
+
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(composingText.convertTarget, "ありがとう")
+    }
+
+    func testAcceptPredictionCandidateRejectsIncompatibleCandidateWithoutMutation() {
+        let converter = KanaKanjiConverter.withoutDictionary()
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("こんにちは", inputStyle: .direct)
+        let original = composingText
+
+        let accepted = converter.acceptPredictionCandidate(
+            self.makeCandidate(text: "こんばんは"),
+            composingText: &composingText
+        )
+
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(composingText.convertTarget, original.convertTarget)
+        XCTAssertEqual(composingText.convertTargetCursorPosition, original.convertTargetCursorPosition)
+        XCTAssertEqual(composingText.input.map(\.piece), original.input.map(\.piece))
+    }
+
     func testRemainingPredictionReturnsUnconsumedSuffix() {
         let entry = PredictiveInputCacheEntry(
             context: .init(

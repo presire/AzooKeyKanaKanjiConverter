@@ -445,6 +445,55 @@ public final class KanaKanjiConverter {
         }
     }
 
+    /// 予測候補を未確定入力に受け入れる。
+    /// 候補の残りの読みを入力へ追加し、以降の変換と予測を受け入れた表記で始まるものに制約する。
+    /// - Parameters:
+    ///   - candidate: 受け入れる予測候補。`ConversionResult.predictionResults` の要素を渡す。
+    ///   - composingText: 候補を受け入れる未確定入力。
+    /// - Returns: 候補が現在の入力に適用でき、入力と制約を更新した場合は `true`。それ以外は `false`。
+    /// - Note:
+    ///   この関数は候補の再計算を行わない。更新後の `composingText` を使って `requestCandidates(_:options:)` を呼び出すこと。
+    ///   受け入れた表記による先頭の制約は Zenzai の変換でだけ使われる。
+    @discardableResult
+    public func acceptPredictionCandidate(_ candidate: Candidate, composingText: inout ComposingText) -> Bool {
+        guard !composingText.isEmpty, composingText.isAtEndIndex else {
+            return false
+        }
+        let candidateRuby = candidate.data.map(\.ruby).joined().toHiragana()
+        guard !candidateRuby.isEmpty else {
+            return false
+        }
+        let inputStyle = composingText.input.last?.inputStyle ?? .direct
+        let source = self.converter.resolvePredictiveInputSource(
+            composingText: composingText,
+            inputStyle: inputStyle
+        )
+        let currentRuby = source.baseConvertTarget.toHiragana()
+        guard candidateRuby.hasPrefix(currentRuby), candidateRuby.count > currentRuby.count else {
+            return false
+        }
+        let remainingRuby = String(candidateRuby.dropFirst(currentRuby.count))
+
+        if source.droppedSuffixCount > 0 {
+            composingText.deleteBackwardFromCursorPosition(count: source.droppedSuffixCount)
+        }
+        composingText.insertAtCursorPosition(remainingRuby, inputStyle: .direct)
+
+        // 前のキー入力の予測は先頭を決める前の文脈のものなので捨てる
+        self.invalidateStablePredictionCandidateCache()
+        self.updateCurrentSessionState {
+            $0.zenzaiCache = $0.zenzaiCache?.settingPrefixCandidate(candidate)
+                ?? Kana2Kanji.ZenzaiCache(
+                    $0.previousInputData ?? ComposingText(),
+                    constraint: .init([]),
+                    satisfyingCandidate: candidate,
+                    evaluatedSatisfyingCandidate: candidate,
+                    prefixCandidate: candidate
+                )
+        }
+        return true
+    }
+
     /// 確定操作後、学習メモリをアップデートする関数。
     /// - Parameters:
     ///   - candidate: 確定された候補。
@@ -641,7 +690,7 @@ public final class KanaKanjiConverter {
     ///   - sums: 変換対象のデータ。
     /// - Returns:
     ///   予測変換候補
-    private func getPredictionCandidate(_ bestCandidateDataForPrediction: consuming CandidateData, composingText: ComposingText, options: ConvertRequestOptions) -> [Candidate] {
+    private func getPredictionCandidate(_ bestCandidateDataForPrediction: consuming CandidateData, composingText: ComposingText, options: ConvertRequestOptions, prefixText: String? = nil) -> [Candidate] {
         // 予測変換は次の方針で行う。
         // prepart: 前半文節 lastPart: 最終文節とする。
         // まず、lastPartがnilであるところから始める
@@ -701,6 +750,10 @@ public final class KanaKanjiConverter {
             )
             candidates.append(contentsOf: consume predictions)
         }
+        // 辞書の予測は最後の文節を読みで引き直すため、先頭の表記を含まない候補が出る。それは除く
+        if let prefixText {
+            candidates.removeAll { !$0.text.hasPrefix(prefixText) }
+        }
         if !candidates.isEmpty {
             return candidates
         }
@@ -743,6 +796,9 @@ public final class KanaKanjiConverter {
             self.requestCandidates(predictedComposingText, options: fallbackOptions)
         }
         guard let firstCandidate = predictedResult.mainResults.first else {
+            return []
+        }
+        if let prefixText, !firstCandidate.text.hasPrefix(prefixText) {
             return []
         }
         return [firstCandidate]
@@ -858,6 +914,32 @@ public final class KanaKanjiConverter {
         return candidates
     }
 
+    /// `Candidate.text` がテンプレート展開済みでも、辞書内の表記を使って制約できるようにする。
+    private func prefixText(of candidate: Candidate) -> String {
+        let dictionaryText = candidate.data.map(\.word).joined()
+        return dictionaryText.isEmpty ? candidate.text : dictionaryText
+    }
+
+    private func candidates(_ candidates: [Candidate], matchingPrefix prefixText: String?) -> [Candidate] {
+        guard let prefixText else {
+            return candidates
+        }
+        return candidates.filter { $0.text.hasPrefix(prefixText) }
+    }
+
+    /// 確定済みのテンプレート部分は再展開せず、その表示を維持して残りだけを展開する。
+    private func prepareCandidateForResult(_ candidate: inout Candidate, prefixCandidate: Candidate?) {
+        candidate.withActions(self.getAppropriateActions(candidate))
+        if let prefixCandidate {
+            let rawPrefixText = self.prefixText(of: prefixCandidate)
+            if rawPrefixText != prefixCandidate.text, candidate.text.hasPrefix(rawPrefixText) {
+                candidate.text = prefixCandidate.text + String(candidate.text.dropFirst(rawPrefixText.count))
+                candidate.isLearningTarget = false
+            }
+        }
+        candidate.parseTemplate()
+    }
+
     /// ラティスを処理し変換候補の形にまとめる関数
     /// - Parameters:
     ///   - inputData: 変換対象のInputData。
@@ -873,11 +955,17 @@ public final class KanaKanjiConverter {
             $0.lattice = result.lattice
         }
         let inputStyle = inputData.input.last?.inputStyle ?? .direct
+        let prefixCandidate = options.zenzaiMode.enabled ? self.currentSessionState.zenzaiCache?.prefixCandidate : nil
+        // テンプレート候補の `text` は表示用に展開済みなので、ラティスや辞書候補との比較には元の表記を使う。
+        let prefixText = prefixCandidate.map { self.prefixText(of: $0) }
         // 比較的大きい配列（〜1000、2000程度の候補が含まれることがある）
         let clauseResult = result.result.getCandidateData()
         if clauseResult.isEmpty {
             self.invalidateStablePredictionCandidateCache()
-            let candidates = self.getUniqueCandidate(self.getAdditionalCandidate(inputData, options: options))
+            let candidates = self.candidates(
+                self.getUniqueCandidate(self.getAdditionalCandidate(inputData, options: options)),
+                matchingPrefix: prefixText
+            )
             return ConversionResult(mainResults: candidates, predictionResults: [], englishPredictionResults: [], firstClauseResults: candidates)   // アーリーリターン
         }
 
@@ -887,7 +975,11 @@ public final class KanaKanjiConverter {
         let wholeSentenceUniqueCandidates: [Candidate]
         if options.requireJapanesePrediction.isEnabled {
             let clauseResultCandidates = clauseResult.map { self.converter.processClauseCandidate($0) }
-            bestCandidateDataForPrediction = zip(clauseResult, clauseResultCandidates).max {$0.1.value < $1.1.value}!.0
+            let candidatePairs = zip(clauseResult, clauseResultCandidates)
+            let prefixPairs = prefixText.map { text in candidatePairs.filter { $0.1.text.hasPrefix(text) } } ?? []
+            bestCandidateDataForPrediction = prefixPairs.isEmpty
+                ? candidatePairs.max {$0.1.value < $1.1.value}!.0
+                : prefixPairs.max {$0.1.value < $1.1.value}!.0
             wholeSentenceUniqueCandidates = self.getUniqueCandidate(clauseResultCandidates)
         } else {
             wholeSentenceUniqueCandidates = self.getUniqueCandidate(clauseResult.lazy.map { self.converter.processClauseCandidate($0) })
@@ -916,7 +1008,10 @@ public final class KanaKanjiConverter {
 
         if case .完全一致 = options.requestQuery {
             self.invalidateStablePredictionCandidateCache()
-            let merged = self.getUniqueCandidate(wholeSentenceUniqueCandidates.chained(userShortcutsCandidates))
+            let merged = self.candidates(
+                self.getUniqueCandidate(wholeSentenceUniqueCandidates.chained(userShortcutsCandidates)),
+                matchingPrefix: prefixText
+            )
             if options.zenzaiMode.enabled {
                 return ConversionResult(mainResults: consume merged, predictionResults: [], englishPredictionResults: [], firstClauseResults: [])
             } else {
@@ -948,11 +1043,14 @@ public final class KanaKanjiConverter {
             var stablePredictionCandidates: [Candidate] = []
             if options.requireJapanesePrediction.isEnabled, let bestCandidateDataForPrediction {
                 let candidates = self.getUniqueCandidate(
-                    self.getPredictionCandidate(bestCandidateDataForPrediction, composingText: inputData, options: options)
+                    self.getPredictionCandidate(bestCandidateDataForPrediction, composingText: inputData, options: options, prefixText: prefixText)
                 ).min(count: 3, sortedBy: {$0.value > $1.value})
-                stablePredictionCandidates = self.stablePredictionCandidates(
-                    composingText: inputData,
-                    inputStyle: inputStyle
+                stablePredictionCandidates = self.candidates(
+                    self.stablePredictionCandidates(
+                        composingText: inputData,
+                        inputStyle: inputStyle
+                    ),
+                    matchingPrefix: prefixText
                 )
                 predictionResults = self.mergeStableCandidates(
                     stableCandidates: stablePredictionCandidates,
@@ -984,12 +1082,15 @@ public final class KanaKanjiConverter {
             // その他のトップレベル変換（先頭に表示されうる変換候補）
             let topLevelAdditionalCandidates = self.getTopLevelAdditionalCandidate(inputData, options: options)
             // best8、foreign_candidates、zeroHintPrediction_candidates、toplevel_additional_candidate、user_shortcuts を混ぜて上位5件を取得する
-            let mixedCandidates = getUniqueCandidate(
-                bestFiveSentenceCandidates
-                    .chained(consume bestThreePredictionCandidates)
-                    .chained(consume foreignCandidates)
-                    .chained(consume topLevelAdditionalCandidates)
-                    .chained(consume userShortcutsCandidates)
+            let mixedCandidates = self.candidates(
+                getUniqueCandidate(
+                    bestFiveSentenceCandidates
+                        .chained(consume bestThreePredictionCandidates)
+                        .chained(consume foreignCandidates)
+                        .chained(consume topLevelAdditionalCandidates)
+                        .chained(consume userShortcutsCandidates)
+                ),
+                matchingPrefix: prefixText
             )
             if options.requireJapanesePrediction.shouldMix {
                 fullCandidates = self.mergeStableCandidates(
@@ -1002,17 +1103,20 @@ public final class KanaKanjiConverter {
             }
         }
         // 文節のみ変換するパターン（上位5件）
-        let uniqueFirstClauseCandidates = self.getUniqueCandidate((consume clauseResult).lazy.map {(candidateData: CandidateData) -> Candidate in
-            let first = candidateData.clauses.first!
-            let count = max(0, first.clause.dataEndIndex)
-            return Candidate(
-                text: first.clause.text,
-                value: first.value,
-                composingCount: first.clause.ranges.reduce(into: .inputCount(0)) { $0 = .composite($0, $1.count) },
-                lastMid: first.clause.mid,
-                data: Array(candidateData.data[0...count])
-            )
-        })
+        let uniqueFirstClauseCandidates = self.candidates(
+            self.getUniqueCandidate((consume clauseResult).lazy.map {(candidateData: CandidateData) -> Candidate in
+                let first = candidateData.clauses.first!
+                let count = max(0, first.clause.dataEndIndex)
+                return Candidate(
+                    text: first.clause.text,
+                    value: first.value,
+                    composingCount: first.clause.ranges.reduce(into: .inputCount(0)) { $0 = .composite($0, $1.count) },
+                    lastMid: first.clause.mid,
+                    data: Array(candidateData.data[0...count])
+                )
+            }),
+            matchingPrefix: prefixText
+        )
 
         var firstClauseResults = uniqueFirstClauseCandidates.min(count: 5) {
             if $0.rubyCount == $1.rubyCount {
@@ -1050,17 +1154,22 @@ public final class KanaKanjiConverter {
                 }
             // その他辞書データに追加する候補
             let additionalCandidates: [Candidate] = self.getAdditionalCandidate(inputData, options: options)
-            var candidates = self.getUniqueCandidate((consume dicCandidates).chained(consume additionalCandidates), seenCandidates: seenCandidate)
-                .sorted {
-                    let count0 = $0.rubyCount
-                    let count1 = $1.rubyCount
-                    return count0 == count1 ? $0.value > $1.value : count0 > count1
-                }
+            var candidates = self.candidates(
+                self.getUniqueCandidate((consume dicCandidates).chained(consume additionalCandidates), seenCandidates: seenCandidate),
+                matchingPrefix: prefixText
+            ).sorted {
+                let count0 = $0.rubyCount
+                let count1 = $1.rubyCount
+                return count0 == count1 ? $0.value > $1.value : count0 > count1
+            }
             for c in candidates {
                 seenCandidate.insert(c.text)
             }
             // 賢く変換するパターン（任意件数）
-            let wiseCandidates = self.getUniqueCandidate(self.getSpecialCandidate(inputData, options: options), seenCandidates: seenCandidate)
+            let wiseCandidates = self.candidates(
+                self.getUniqueCandidate(self.getSpecialCandidate(inputData, options: options), seenCandidates: seenCandidate),
+                matchingPrefix: prefixText
+            )
             // 途中でwise_candidatesを挟む
             candidates.insert(contentsOf: consume wiseCandidates, at: min(5, candidates.endIndex))
             wordCandidates = consume candidates
@@ -1086,17 +1195,17 @@ public final class KanaKanjiConverter {
         result.append(contentsOf: consume firstClauseCandidates)
         result.append(contentsOf: consume wordCandidates)
 
+        result = self.candidates(consume result, matchingPrefix: prefixText)
+        predictionResults = self.candidates(consume predictionResults, matchingPrefix: prefixText)
+
         result.mutatingForEach { item in
-            item.withActions(self.getAppropriateActions(item))
-            item.parseTemplate()
+            self.prepareCandidateForResult(&item, prefixCandidate: prefixCandidate)
         }
         firstClauseResults.mutatingForEach { item in
-            item.withActions(self.getAppropriateActions(item))
-            item.parseTemplate()
+            self.prepareCandidateForResult(&item, prefixCandidate: prefixCandidate)
         }
         predictionResults.mutatingForEach { item in
-            item.withActions(self.getAppropriateActions(item))
-            item.parseTemplate()
+            self.prepareCandidateForResult(&item, prefixCandidate: prefixCandidate)
         }
         englishPredictionResults.mutatingForEach { item in
             item.withActions(self.getAppropriateActions(item))
