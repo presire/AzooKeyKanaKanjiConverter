@@ -479,6 +479,21 @@ public final class KanaKanjiConverter {
         self.dicdataStoreState.forgetMemory(candidate)
     }
 
+    /// 指定した読み・表記・接続IDに完全一致する学習メモリのみを削除します。
+    public func forgetLearningMemory(reading: String, word: String, lcid: Int, rcid: Int) throws {
+        try self.dicdataStoreState.forgetLearningMemory(
+            exactly: .init(reading: reading, word: word, lcid: lcid, rcid: rcid)
+        )
+    }
+
+    /// 永続化済み学習メモリをページ単位で取得します。
+    public func learningMemoryEntries(offset: Int = 0, limit: Int = 256) throws -> LearningMemoryPage {
+        try self.dicdataStoreState.learningMemoryEntries(
+            offset: offset,
+            limit: min(max(limit, 1), 1024)
+        )
+    }
+
     /// 確定操作後の学習メモリの更新を確定させます。
     public func resetMemory() {
         self.dicdataStoreState.resetMemory()

@@ -105,6 +105,51 @@ struct LongTermLearningMemory {
             }
             return data
         }
+
+        static func readAll(from data: Data) throws -> [MetadataBlock] {
+            let nodeCountSize = MemoryLayout<UInt32>.size
+            guard data.count >= nodeCountSize else {
+                throw LearningMemoryEnumerationError.malformedMetadata
+            }
+
+            let nodeCount = data.withUnsafeBytes { buffer in
+                buffer.loadUnaligned(fromByteOffset: 0, as: UInt32.self)
+            }
+            var offset = nodeCountSize
+            var blocks: [MetadataBlock] = []
+            blocks.reserveCapacity(Int(nodeCount))
+
+            for _ in 0 ..< Int(nodeCount) {
+                guard offset < data.count else {
+                    throw LearningMemoryEnumerationError.malformedMetadata
+                }
+                let itemCount = Int(data[data.startIndex + offset])
+                offset += MemoryLayout<UInt8>.size
+                let byteCount = itemCount * MemoryLayout<MetadataElement>.size
+                guard byteCount <= data.count - offset else {
+                    throw LearningMemoryEnumerationError.malformedMetadata
+                }
+
+                var metadata: [MetadataElement] = []
+                metadata.reserveCapacity(itemCount)
+                for _ in 0 ..< itemCount {
+                    let element = data.withUnsafeBytes { buffer in
+                        buffer.loadUnaligned(
+                            fromByteOffset: offset,
+                            as: MetadataElement.self
+                        )
+                    }
+                    metadata.append(element)
+                    offset += MemoryLayout<MetadataElement>.size
+                }
+                blocks.append(.init(metadata: metadata))
+            }
+
+            guard offset == data.count else {
+                throw LearningMemoryEnumerationError.malformedMetadata
+            }
+            return blocks
+        }
     }
 
     fileprivate struct DataBlock {
@@ -181,8 +226,129 @@ struct LongTermLearningMemory {
         }
     }
 
+    static func learningMemoryEntries(
+        directoryURL: URL,
+        offset: Int,
+        limit: Int
+    ) throws -> LearningMemoryPage {
+        guard offset >= 0 else {
+            throw LearningMemoryEnumerationError.invalidOffset
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directoryURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw LearningMemoryEnumerationError.directoryMissing
+        }
+        guard !fileExist(pauseFileURL(directoryURL: directoryURL)) else {
+            throw LearningMemoryEnumerationError.pausedSnapshot
+        }
+
+        let metadataURL = metadataFileURL(asTemporaryFile: false, directoryURL: directoryURL)
+        guard fileExist(metadataURL) else {
+            return .init(entries: [], totalCount: 0, nextOffset: nil)
+        }
+
+        let metadataBlocks = try MetadataBlock.readAll(from: Data(contentsOf: metadataURL))
+        let totalCount = metadataBlocks.reduce(into: 0) { $0 += $1.metadata.count }
+        let pageStart = min(offset, totalCount)
+        let pageEnd = pageStart + min(limit, totalCount - pageStart)
+        let pageRange = pageStart ..< pageEnd
+        var entries: [LearningMemoryEntry] = []
+        entries.reserveCapacity(pageRange.count)
+        var rowIndex = 0
+
+        for shardIndex in 0 ..< (metadataBlocks.count + txtFileSplit - 1) / txtFileSplit {
+            let shardURL = loudsTxt3FileURL("\(shardIndex)", asTemporaryFile: false, directoryURL: directoryURL)
+            guard fileExist(shardURL) else {
+                throw LearningMemoryEnumerationError.malformedShard
+            }
+            let shardData = try Data(contentsOf: shardURL)
+            guard shardData.count >= MemoryLayout<UInt16>.size else {
+                throw LearningMemoryEnumerationError.malformedShard
+            }
+            let nodeCount = shardData.withUnsafeBytes { buffer in
+                Int(buffer.loadUnaligned(fromByteOffset: 0, as: UInt16.self))
+            }
+            let firstNode = shardIndex * txtFileSplit
+            let nodesInShard = min(txtFileSplit, metadataBlocks.count - firstNode)
+            guard nodeCount >= nodesInShard else {
+                throw LearningMemoryEnumerationError.malformedShard
+            }
+
+            for localNodeIndex in 0 ..< nodesInShard {
+                let data = LOUDS.getMemoryDataForLoudstxt3(
+                    "\(shardIndex)",
+                    indices: [localNodeIndex],
+                    cache: shardData,
+                    memoryURL: directoryURL
+                )
+                let metadata = metadataBlocks[firstNode + localNodeIndex].metadata
+                guard data.count == metadata.count else {
+                    throw LearningMemoryEnumerationError.inconsistentSnapshot
+                }
+                for (element, elementMetadata) in zip(data, metadata) {
+                    if pageRange.contains(rowIndex) {
+                        entries.append(
+                            .init(
+                                data: element,
+                                count: elementMetadata.count,
+                                lastUsed: date(for: elementMetadata.lastUsedDay),
+                                lastUpdated: date(for: elementMetadata.lastUpdatedDay)
+                            )
+                        )
+                    }
+                    rowIndex += 1
+                }
+            }
+        }
+
+        guard rowIndex == totalCount else {
+            throw LearningMemoryEnumerationError.inconsistentSnapshot
+        }
+        let nextOffset = offset + entries.count < totalCount ? offset + entries.count : nil
+        return .init(entries: entries, totalCount: totalCount, nextOffset: nextOffset)
+    }
+
+    private static func date(for day: UInt16) -> Date {
+        Date(timeIntervalSince1970: TimeInterval(Int(day) + 19000) * 86400)
+    }
+
     /// 一時記憶と長期記憶の学習データをマージする
     static func merge(tempTrie: consuming TemporalLearningMemoryTrie, forgetTargets: [DicdataElement] = [], directoryURL: URL, maxMemoryCount: Int, char2UInt8: [Character: UInt8]) throws {
+        let forgetTargetWords = Set(forgetTargets.map { $0.word })
+        try merge(
+            tempTrie: tempTrie,
+            forgetPolicy: .words(forgetTargetWords),
+            directoryURL: directoryURL,
+            maxMemoryCount: maxMemoryCount,
+            char2UInt8: char2UInt8
+        )
+    }
+
+    static func mergeExactlyForgetting(tempTrie: consuming TemporalLearningMemoryTrie, target: LearningMemoryKey, directoryURL: URL, maxMemoryCount: Int, char2UInt8: [Character: UInt8]) throws {
+        try merge(
+            tempTrie: tempTrie,
+            forgetPolicy: .exact(target),
+            directoryURL: directoryURL,
+            maxMemoryCount: maxMemoryCount,
+            char2UInt8: char2UInt8
+        )
+    }
+
+    private enum ForgetPolicy {
+        case words(Set<String>)
+        case exact(LearningMemoryKey)
+
+        func matches(_ element: DicdataElement) -> Bool {
+            switch self {
+            case .words(let words):
+                words.contains(element.word)
+            case .exact(let target):
+                target.matches(element)
+            }
+        }
+    }
+
+    private static func merge(tempTrie: consuming TemporalLearningMemoryTrie, forgetPolicy: ForgetPolicy, directoryURL: URL, maxMemoryCount: Int, char2UInt8: [Character: UInt8]) throws {
         // MARK: `.pause`ファイルが存在する場合、`merge`を行う前に`.2`ファイルの復活を試み、失敗した場合は`merge`を諦める。
         if fileExist(pauseFileURL(directoryURL: directoryURL)) {
             debug("LongTermLearningMemory merge collapsion detected, trying recovery...")
@@ -211,7 +377,6 @@ struct LongTermLearningMemory {
 
         debug("LongTermLearningMemory merge entryCount", entryCount, ltMetadata.count)
 
-        let forgetTargetWords = Set(forgetTargets.map { $0.word })
         // それぞれのloudstxt3ファイルに対して処理を行う
         for loudstxtIndex in 0 ..< Int(entryCount) / txtFileSplit + 1 {
             let loudstxtData: Data
@@ -252,7 +417,7 @@ struct LongTermLearningMemory {
                 assert(elements.count == metadata.count, "elements count and metadata count must be equal.")
                 for (dicdataElement, metadataElement) in zip(elements, metadata) {
                     // 忘却対象である場合は弾く（粗いチェック）
-                    if forgetTargetWords.contains(dicdataElement.word) {
+                    if forgetPolicy.matches(dicdataElement) {
                         debug("LongTermLearningMemory merge stopped because it is a forget target", dicdataElement)
                         continue
                     }
@@ -547,6 +712,20 @@ struct TemporalLearningMemoryTrie {
         nodes[index].dataIndices.removeAll {
             self.dicdata[$0].word == dicdataElement.word
         }
+        return true
+    }
+
+    @discardableResult
+    mutating func forget(exactly target: LearningMemoryKey, chars: [UInt8]) -> Bool {
+        var index = 0
+        for char in chars {
+            if let nextIndex = nodes[index].children[char] {
+                index = nextIndex
+            } else {
+                return false
+            }
+        }
+        nodes[index].dataIndices.removeAll { target.matches(self.dicdata[$0]) }
         return true
     }
 
@@ -850,6 +1029,38 @@ final class LearningManager {
         }
         // 状態を更新する
         self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
+    }
+
+    func forgetLearningMemory(exactly target: LearningMemoryKey) throws {
+        guard self.config.learningType.needUpdateMemory else {
+            return
+        }
+        guard let memoryURL = config.memoryURL else {
+            throw LearningMemoryEnumerationError.memoryDirectoryUnavailable
+        }
+        if let chars = Self.keyToChars(target.reading, char2UInt8: char2UInt8) {
+            self.temporaryMemory.forget(exactly: target, chars: chars)
+        }
+        try LongTermLearningMemory.mergeExactlyForgetting(
+            tempTrie: self.temporaryMemory,
+            target: target,
+            directoryURL: memoryURL,
+            maxMemoryCount: self.config.maxMemoryCount,
+            char2UInt8: char2UInt8
+        )
+        self.temporaryMemory = TemporalLearningMemoryTrie()
+        self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
+    }
+
+    func learningMemoryEntries(offset: Int, limit: Int) throws -> LearningMemoryPage {
+        guard let memoryURL = config.memoryURL else {
+            throw LearningMemoryEnumerationError.memoryDirectoryUnavailable
+        }
+        return try LongTermLearningMemory.learningMemoryEntries(
+            directoryURL: memoryURL,
+            offset: offset,
+            limit: limit
+        )
     }
 
     @discardableResult
