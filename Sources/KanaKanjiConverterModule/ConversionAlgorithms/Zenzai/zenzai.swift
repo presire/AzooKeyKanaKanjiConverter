@@ -581,7 +581,12 @@ extension Kana2Kanji {
                 fixedPrefix: constraint.fixedPrefix
             )
             if constraint == newConstraint {
-                if !constraint.ignoreMemoryAndUserDictionary, candidates[candidateIndex].data.contains(where: { !$0.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary])}) {
+                if !constraint.ignoreMemoryAndUserDictionary,
+                   candidates[candidateIndex].data.contains(where: { !$0.metadata.isDisjoint(with: [.isLearned]) }),
+                   candidates[candidateIndex].data.allSatisfy({ $0.metadata.isDisjoint(with: [.isFromUserDictionary]) }) {
+                    // [hazkey-community patch] Preserve explicitly registered user-dictionary candidates.
+                    // A repeated identical constraint must use the existing give-up path when it
+                    // contains a user-dictionary entry; retain this retry only for learned entries.
                     // `ignoreMemoryAndUserDictionary`でない場合、学習候補がモデルにリジェクトされた可能性を検討する
                     debug("same constraint (fixRequired), but retry without memory and user dictionary:", newConstraint)
                     constraint.ignoreMemoryAndUserDictionary = true
@@ -623,7 +628,12 @@ extension Kana2Kanji {
             )
             // 同じ制約が2回連続で出てきたら諦める
             if constraint == newConstraint {
-                if !constraint.ignoreMemoryAndUserDictionary, candidates[candidateIndex].data.contains(where: { !$0.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary])}) {
+                if !constraint.ignoreMemoryAndUserDictionary,
+                   candidates[candidateIndex].data.contains(where: { !$0.metadata.isDisjoint(with: [.isLearned]) }),
+                   candidates[candidateIndex].data.allSatisfy({ $0.metadata.isDisjoint(with: [.isFromUserDictionary]) }) {
+                    // [hazkey-community patch] Preserve explicitly registered user-dictionary candidates.
+                    // A repeated identical constraint must use the existing give-up path when it
+                    // contains a user-dictionary entry; retain this retry only for learned entries.
                     // `ignoreMemoryAndUserDictionary`でない場合、学習候補がモデルにリジェクトされた可能性を検討する
                     debug("same constraint (wholeResult), but retry without memory and user dictionary:", constraint)
                     constraint.ignoreMemoryAndUserDictionary = true
