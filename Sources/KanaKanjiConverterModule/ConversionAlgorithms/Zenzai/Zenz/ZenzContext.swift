@@ -226,14 +226,15 @@ enum ZenzError: LocalizedError {
 /// コンテキストより先に解放される可能性があるプロセス終了時の明示解放は行わない。
 private enum ZenzBackend {
     private static let initialized: Void = {
-        // Mitigate SIGILL crash on multi-GPU Linux systems where multiple
-        // Vulkan ICDs (e.g. nvidia_icd.json + radeon_icd.json) coexist.
+        // Mitigate SIGILL crash on multi-GPU Linux systems where Vulkan ICDs
+        // from different vendors (e.g. nvidia_icd.json + radeon_icd.json)
+        // coexist.
         // Ref: https://github.com/7ka-Hiira/hazkey/issues/29
-        // Pin to a single ICD *before* ggml_backend_load_all() runs, because
-        // once the Vulkan loader creates a VkInstance it initializes every
-        // available ICD and the resulting vendor-mixed state triggers a Swift
-        // runtime precondition failure (ud2 -> SIGILL) that cannot be caught
-        // by Swift do/catch.
+        // Restrict the loader to a single vendor's ICDs *before*
+        // ggml_backend_load_all() runs, because once the Vulkan loader
+        // creates a VkInstance it initializes every available ICD and the
+        // resulting vendor-mixed state triggers a Swift runtime precondition
+        // failure (ud2 -> SIGILL) that cannot be caught by Swift do/catch.
         Self.pinVulkanICDIfNeeded()
 
         llama_backend_init()
@@ -243,9 +244,10 @@ private enum ZenzBackend {
         _ = self.initialized
     }
 
-    /// Detect Vulkan ICDs in standard search paths and, when more than one is
-    /// installed, restrict the Vulkan loader to the first detected ICD by
-    /// exporting `VK_DRIVER_FILES` / `VK_ICD_FILENAMES`.
+    /// Detect Vulkan ICDs in standard search paths and, when ICDs from more
+    /// than one vendor are installed, restrict the Vulkan loader to the ICDs
+    /// of the first vendor found by exporting `VK_DRIVER_FILES` /
+    /// `VK_ICD_FILENAMES`.
     ///
     /// This is a workaround for https://github.com/7ka-Hiira/hazkey/issues/29
     /// where multi-GPU systems (e.g. NVIDIA dGPU + AMD/Intel iGPU) with both
@@ -259,6 +261,12 @@ private enum ZenzBackend {
     /// Notes:
     /// - Only intervenes when 2+ ICDs are detected; single-ICD systems are
     ///   not affected by Issue #29 and are left untouched.
+    /// - Every ICD of the chosen vendor is kept. Same-vendor ICDs coexist
+    ///   safely, and pinning one arbitrary file can select a driver that
+    ///   does not support the installed GPU: intel_hasvk_icd.x86_64.json
+    ///   sorts before intel_icd.x86_64.json, and HASVK only supports Gen7/8,
+    ///   so a Kaby Lake (Gen9.5) iGPU would be invisible even though ANV
+    ///   supports it.
     /// - Must be called *before* any ggml backend / Vulkan API call.
     private static func pinVulkanICDIfNeeded() {
         let env = ProcessInfo.processInfo.environment
@@ -281,7 +289,9 @@ private enum ZenzBackend {
         var foundICDs: [String] = []
         for searchPath in icdSearchPaths {
             guard let candidates = try? fm.contentsOfDirectory(atPath: searchPath) else { continue }
-            for candidate in candidates where candidate.hasSuffix(".json") {
+            // Directory order is not stable across filesystems; sort so the
+            // vendor group chosen below is deterministic.
+            for candidate in candidates.filter({ $0.hasSuffix(".json") }).sorted() {
                 foundICDs.append("\(searchPath)/\(candidate)")
             }
         }
@@ -290,10 +300,38 @@ private enum ZenzBackend {
         // systems are not affected by Issue #29.
         guard foundICDs.count > 1 else { return }
 
-        let pinned = foundICDs[0]
+        let firstVendor = VulkanICDVendor(filename: URL(fileURLWithPath: foundICDs[0]).lastPathComponent)
+        let pinned = foundICDs
+            .filter { VulkanICDVendor(filename: URL(fileURLWithPath: $0).lastPathComponent) == firstVendor }
+            .joined(separator: ":")
         debug("[Vulkan ICD] Multi-ICD environment detected: \(foundICDs). Pinning to \(pinned) to avoid SIGILL (Issue #29).")
         setenv("VK_DRIVER_FILES", pinned, 1)
         setenv("VK_ICD_FILENAMES", pinned, 1)
+    }
+
+    /// Groups ICD filenames by vendor so that only manifests of the same
+    /// vendor are pinned together. Unknown names only match themselves,
+    /// which keeps the previous single-file behavior for unknown drivers.
+    private enum VulkanICDVendor: Equatable {
+        case intel
+        case nvidia
+        case amd
+        case lavapipe
+        case other(String)
+
+        init(filename: String) {
+            if filename.hasPrefix("intel") {
+                self = .intel
+            } else if filename.contains("nvidia") {
+                self = .nvidia
+            } else if filename.contains("radeon") || filename.contains("amd") {
+                self = .amd
+            } else if filename.contains("lvp") {
+                self = .lavapipe
+            } else {
+                self = .other(filename)
+            }
+        }
     }
 }
 
