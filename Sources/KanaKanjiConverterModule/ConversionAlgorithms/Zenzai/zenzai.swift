@@ -198,6 +198,9 @@ extension Kana2Kanji {
     ) -> (result: LatticeNode, lattice: Lattice, cache: ZenzaiCache) {
         // [hazkey-community patch] opt-in Zenzai CPU latency deadline (HAZKEY_ZENZAI_DEADLINE_MS)
         ZenzInferencePerf.shared.beginDeadlineWindow()
+        // [hazkey-community patch] jinen (Qwen3) は NFKC 正規化空間で出力するため、
+        // 辞書表記との制約比較を NFKC 正規化して行う (fixRequired/wholeResult の空振り防止)。
+        let isJinen = zenz.isJinenModel
         let latticeInputData = Self.zenzaiLatticeInputData(for: inputData)
         let zenzInputCursorPosition = Self.zenzaiInputCursorPosition(for: inputData)
         let inputStyle = inputData.input.last?.inputStyle ?? .direct
@@ -445,7 +448,8 @@ extension Kana2Kanji {
                     candidateIndex: index,
                     candidates: candidates,
                     reviewResult: reviewResult,
-                    constraint: &constraint
+                    constraint: &constraint,
+                    isJinen: isJinen
                 )
                 switch nextAction {
                 case .return(let constraint, let alternativeConstraints, let satisfied):
@@ -459,7 +463,7 @@ extension Kana2Kanji {
                             )
                             // constructed candidatesのうちalternativeConstraint.prefixConstraintを満たすものを列挙する
                             let mostLiklyCandidate = constructedCandidates.filter {
-                                self.candidate($0.1, satisfies: normalizedAlternativeConstraint)
+                                self.candidate($0.1, satisfies: normalizedAlternativeConstraint, isJinen: isJinen)
                             }.max {
                                 $0.1.value < $1.1.value
                             }
@@ -562,7 +566,8 @@ extension Kana2Kanji {
         candidateIndex: Int,
         candidates: [Candidate],
         reviewResult: consuming CandidateEvaluationResult,
-        constraint: inout PrefixConstraint
+        constraint: inout PrefixConstraint,
+        isJinen: Bool
     ) -> NextAction {
         switch reviewResult {
         case .error:
@@ -591,7 +596,7 @@ extension Kana2Kanji {
                     debug("same constraint (fixRequired), but retry without memory and user dictionary:", newConstraint)
                     constraint.ignoreMemoryAndUserDictionary = true
                     for (i, candidate) in candidates.indexed() where i != candidateIndex {
-                        if self.candidate(candidate, satisfies: newConstraint) && self.heuristicRetryValidation(candidate.text) {
+                        if self.candidate(candidate, satisfies: newConstraint, isJinen: isJinen) && self.heuristicRetryValidation(candidate.text) {
                             debug("found \(candidate.text) as another retry")
                             return .retry(candidateIndex: i)
                         }
@@ -612,7 +617,7 @@ extension Kana2Kanji {
                 // この処理の正当性は、prefix constraintが漸進的に更新され、candidatesの構築時に可能な候補がすべて確認されたことに由来する
                 // このため、学習候補などが最終ドラフトとして採択され、prefix constraintが漸進的更新になっていない場合（!isIncrementalUpdate）この処理は行わない
                 for (i, candidate) in candidates.indexed() where i != candidateIndex {
-                    if self.candidate(candidate, satisfies: newConstraint) && self.heuristicRetryValidation(candidate.text) {
+                    if self.candidate(candidate, satisfies: newConstraint, isJinen: isJinen) && self.heuristicRetryValidation(candidate.text) {
                         debug("found \(candidate.text) as another retry")
                         return .retry(candidateIndex: i)
                     }
@@ -638,7 +643,7 @@ extension Kana2Kanji {
                     debug("same constraint (wholeResult), but retry without memory and user dictionary:", constraint)
                     constraint.ignoreMemoryAndUserDictionary = true
                     for (i, candidate) in candidates.indexed() where i != candidateIndex {
-                        if self.candidate(candidate, satisfies: newConstraint) && self.heuristicRetryValidation(candidate.text) {
+                        if self.candidate(candidate, satisfies: newConstraint, isJinen: isJinen) && self.heuristicRetryValidation(candidate.text) {
                             debug("found \(candidate.text) as another retry")
                             return .retry(candidateIndex: i)
                         }
@@ -658,7 +663,7 @@ extension Kana2Kanji {
                 // もし制約を満たす候補があるならそれを使って再レビューチャレンジを戦うことで、推論を減らせる
                 // 上記と同様に、prefix constraintが漸進的更新になっていない場合（!isIncrementalUpdate）この処理は行わない
                 for (i, candidate) in candidates.indexed() where i != candidateIndex {
-                    if self.candidate(candidate, satisfies: newConstraint) && self.heuristicRetryValidation(candidate.text) {
+                    if self.candidate(candidate, satisfies: newConstraint, isJinen: isJinen) && self.heuristicRetryValidation(candidate.text) {
                         debug("found \(candidate.text) as another retry")
                         return .retry(candidateIndex: i)
                     }
@@ -694,11 +699,24 @@ extension Kana2Kanji {
         return nil
     }
 
-    private func candidate(_ candidate: Candidate, satisfies constraint: PrefixConstraint) -> Bool {
+    private func candidate(_ candidate: Candidate, satisfies constraint: PrefixConstraint, isJinen: Bool = false) -> Bool {
+        if !isJinen {
+            // zenz は従来どおり生バイト比較 (挙動不変)。
+            if constraint.hasEOS {
+                return candidate.text.utf8.elementsEqual(constraint.constraint)
+            } else {
+                return candidate.text.utf8.hasPrefix(constraint.constraint)
+            }
+        }
+        // [hazkey-community patch] jinen (Qwen3) は NFKC 正規化空間で出力するため、
+        // モデル出力由来の制約バイトと辞書候補表記を NFKC 正規化して比較する。
+        let candidateText = candidate.text.precomposedStringWithCompatibilityMapping
+        let constraintText = String(decoding: constraint.constraint, as: UTF8.self)
+            .precomposedStringWithCompatibilityMapping
         if constraint.hasEOS {
-            return candidate.text.utf8.elementsEqual(constraint.constraint)
+            return candidateText.utf8.elementsEqual(constraintText.utf8)
         } else {
-            return candidate.text.utf8.hasPrefix(constraint.constraint)
+            return candidateText.utf8.hasPrefix(constraintText.utf8)
         }
     }
 

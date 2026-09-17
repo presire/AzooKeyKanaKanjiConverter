@@ -20,10 +20,14 @@ struct ZenzInputTextGenerator {
         guard count > 0 else {
             return ""
         }
+        // [hazkey-community patch] jinen (Qwen3) は条件トークン (U+EE03-EE06) を学習していない。
+        let effectiveConfig = context.isJinenModel
+            ? ZenzCandidateEvaluator.jinenAdjustedMode(versionDependentConfig)
+            : versionDependentConfig
         guard let prompt = ZenzPromptBuilder.inputPredictionPrompt(
             leftSideContext: leftSideContext,
             composingText: composingText,
-            versionDependentConfig: versionDependentConfig
+            versionDependentConfig: effectiveConfig
         ) else {
             return ""
         }
@@ -42,7 +46,8 @@ struct ZenzInputTextGenerator {
             })
         }
 
-        var promptTokens = context.encode(prompt, addBOS: true, addEOS: false)
+        // [hazkey-community patch] jinen (Qwen3) は BOS (<s>) を付加しない。
+        var promptTokens = context.encode(prompt, addBOS: !context.isJinenModel, addEOS: false)
         let minLength = max(1, min(minLength, count))
         let vocabSize = Int(context.vocabSize)
         let stopCharacters: Set<Character> = ["、", "。", "！", "？"]

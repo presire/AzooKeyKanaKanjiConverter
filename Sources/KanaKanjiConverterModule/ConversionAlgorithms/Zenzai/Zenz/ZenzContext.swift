@@ -614,6 +614,7 @@ final class SharedZenzModel {
         }
         self.model = model
         self.vocab = vocab
+        self.architecture = Self.architecture(of: model)
     }
 
     deinit {
@@ -622,6 +623,20 @@ final class SharedZenzModel {
 
     let model: OpaquePointer
     let vocab: OpaquePointer
+
+    // [hazkey-community patch] GGUF の `general.architecture`。
+    // jinen (Qwen3) 系は NFKC 正規化・BOS 無し・条件トークン無しで推論する必要があり、
+    // `ZenzContext` がこの値でモードを判定する。既存 zenz は "zenz" を返すため無変更。
+    let architecture: String
+
+    private static func architecture(of model: OpaquePointer) -> String {
+        var buffer = [CChar](repeating: 0, count: 64)
+        let length = llama_model_meta_val_str(model, "general.architecture", &buffer, buffer.count)
+        guard length > 0 else {
+            return ""
+        }
+        return String(cString: buffer)
+    }
 }
 
 /// 同時に強参照するモデルを1個に制限する、プロセス共通のモデルキャッシュ。
@@ -1028,7 +1043,19 @@ final class ZenzContext {
     }
 
     func normalizeForModel(_ text: String) -> String {
-        self.preprocessText(text: text)
+        if self.isJinenModel {
+            // [hazkey-community patch] jinen (Qwen3) は NFKC 正規化済みテキストで学習されており、
+            // zenz 用の space→U+3000 / newline 削除ハックは適用しない。
+            return text.precomposedStringWithCompatibilityMapping
+        }
+        return self.preprocessText(text: text)
+    }
+
+    /// [hazkey-community patch] GGUF の `general.architecture` が "qwen3" のとき true。
+    /// jinen-v2 (karukan) 系は NFKC 前提・BOS 無し・条件トークン (U+EE03-EE06) 無しで
+    /// 学習されているため、zenz (v2/v3) とは異なる前処理・符号化を使う。
+    var isJinenModel: Bool {
+        self.sharedModel.architecture == "qwen3"
     }
 
     func encodeEvaluationPrompt(
@@ -1038,13 +1065,17 @@ final class ZenzContext {
         if let cached = memoizationCache.cachedEvaluationPromptTokens(for: prompt) {
             return cached
         }
-        let tokens = self.encode(prompt, addBOS: true, addEOS: false)
+        // [hazkey-community patch] jinen (Qwen3) は BOS (<s>) を付加せずに学習されている
+        // (HF の post_processor は </s> のみ付加)。zenz は従来どおり BOS を付加する。
+        let tokens = self.encode(prompt, addBOS: !self.isJinenModel, addEOS: false)
         memoizationCache.cacheEvaluationPromptTokens(tokens, for: prompt)
         return tokens
     }
 
     func encode(_ text: String, addBOS: Bool, addEOS: Bool = false) -> [llama_token] {
-        self.tokenize(text: self.preprocessText(text: text), add_bos: addBOS, add_eos: addEOS)
+        // [hazkey-community patch] zenz は preprocessText (space→U+3000 / newline 削除) のまま、
+        // jinen は normalizeForModel が NFKC 正規化を返す。zenz の挙動は不変。
+        self.tokenize(text: self.normalizeForModel(text), add_bos: addBOS, add_eos: addEOS)
     }
 
     func encodeRaw(_ text: String, addBOS: Bool, addEOS: Bool = false) -> [llama_token] {

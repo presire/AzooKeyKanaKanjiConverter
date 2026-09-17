@@ -140,20 +140,29 @@ struct ZenzCandidateEvaluator {
     ) -> CandidateEvaluationResult {
         debug("Evaluate", candidate)
         var userDictionaryPrompt = ""
-        for item in candidate.data where item.metadata.contains(.isFromUserDictionary) {
-            userDictionaryPrompt += "\(item.word)(\(item.ruby.toHiragana()))"
+        if !context.isJinenModel {
+            // [hazkey-community patch] jinen (Qwen3) は「辞書:」条件プロンプト
+            // (U+EE03-EE06 体系) を学習していないため、条件を付与しない。
+            for item in candidate.data where item.metadata.contains(.isFromUserDictionary) {
+                userDictionaryPrompt += "\(item.word)(\(item.ruby.toHiragana()))"
+            }
         }
+        // [hazkey-community patch] jinen では profile/topic/style/preference・右文脈・
+        // alignment separator を落とし、zenz v3 と同一のタグ構造 (EE02/EE00/EE01) にする。
+        let effectiveConfig = context.isJinenModel
+            ? Self.jinenAdjustedMode(versionDependentConfig)
+            : versionDependentConfig
         let prompt = ZenzPromptBuilder.candidateEvaluationPrompt(
             input: input,
             inputCursorPosition: inputCursorPosition,
             userDictionaryPrompt: userDictionaryPrompt,
-            versionDependentConfig: versionDependentConfig
+            versionDependentConfig: effectiveConfig
         )
         let candidateTextForEvaluation = self.candidateTextForEvaluation(
             candidateText: candidate.text,
             input: input,
             inputCursorPosition: inputCursorPosition,
-            versionDependentConfig: versionDependentConfig
+            versionDependentConfig: effectiveConfig
         )
         let normalizedPrompt = context.normalizeForModel(prompt)
         let prevPrompt = context.previousEvaluationPrompt()
@@ -426,6 +435,25 @@ struct ZenzCandidateEvaluator {
                 }
             )
         )
+    }
+
+    /// [hazkey-community patch] jinen (Qwen3) 用に v3 条件 (profile/topic/style/preference)、
+    /// 右文脈、alignment separator を除いたモードを返す。既存 zenz のモードは無変更。
+    static func jinenAdjustedMode(
+        _ config: ConvertRequestOptions.ZenzaiVersionDependentMode
+    ) -> ConvertRequestOptions.ZenzaiVersionDependentMode {
+        switch config {
+        case .v2:
+            return config
+        case .v3(var mode):
+            mode.profile = nil
+            mode.topic = nil
+            mode.style = nil
+            mode.preference = nil
+            mode.rightSideContext = nil
+            mode.enableAlignmentSeparator = false
+            return .v3(mode)
+        }
     }
 
     static func candidateTextForEvaluation(

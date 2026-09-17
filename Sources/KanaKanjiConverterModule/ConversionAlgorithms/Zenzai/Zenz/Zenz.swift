@@ -82,6 +82,12 @@ package final class Zenz {
         }
     }
 
+    /// [hazkey-community patch] ロード中モデルが jinen (Qwen3) 系かどうか。
+    /// `Kana2Kanji.all_zenzai` が辞書表記との制約比較を NFKC 正規化して行うために参照する。
+    package var isJinenModel: Bool {
+        self.zenzContext?.isJinenModel ?? false
+    }
+
     package func endSession() {
         // contextはモデル単位で共有される。各呼び出し時にtoken prefixを照合して
         // 不一致範囲を除去するため、Converter単位のnative context再生成は不要。
