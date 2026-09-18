@@ -827,12 +827,21 @@ final class LearningManager {
         Self.updateChar2Int8(bundleURL: dictionaryURL, target: &self.char2UInt8)
     }
 
+    /// 学習に実際に使われる memory ディレクトリ。学習が無効なら参照されないので `nil` 扱いにする。
+    private static func effectiveMemoryURL(of config: LearningConfig) -> URL? {
+        config.learningType.needUsingMemory ? config.memoryURL : nil
+    }
+
     /// - Returns: Whether cache should be reseted or not.
     func updateConfig(_ newConfig: LearningConfig) -> Bool {
+        // memory LOUDS キャッシュは memory ディレクトリに紐づく。ディレクトリが変わったら必ず
+        // リセットを要求しないと、`DicdataStoreState.memoryURL` だけが新ディレクトリに切り替わり、
+        // 旧ディレクトリで構築された trie の node index で新ディレクトリのシャードを読むことになる。
+        let memoryURLChanged = Self.effectiveMemoryURL(of: self.config) != Self.effectiveMemoryURL(of: newConfig)
         // 更新の必要がなければ何もしない
         if !newConfig.learningType.needUsingMemory {
             self.config = newConfig
-            return false
+            return memoryURLChanged
         }
         // ここで更新
         self.config = newConfig
@@ -840,7 +849,7 @@ final class LearningManager {
         // 学習の壊れ状態を確認
         guard let memoryURL = newConfig.memoryURL else {
             debug(#function, "memoryURL is nil")
-            return false
+            return memoryURLChanged
         }
         self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
         if self.memoryCollapsed && newConfig.learningType.needUsingMemory {
@@ -866,7 +875,7 @@ final class LearningManager {
         case .nothing:
             self.temporaryMemory = TemporalLearningMemoryTrie()
         }
-        return false
+        return memoryURLChanged
     }
 
     func temporaryPerfectMatch(charIDs: [UInt8]) -> [DicdataElement] {

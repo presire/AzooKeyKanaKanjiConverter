@@ -107,6 +107,27 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertFalse(dicdata2.contains { $0.word == element.word && $0.ruby == element.ruby })
     }
 
+    private func makeTemporaryDirectory() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("LearningMemoryTest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    func testUpdateConfigReportsCacheResetOnlyWhenMemoryURLChanges() throws {
+        let dirA = try makeTemporaryDirectory()
+        let dirB = try makeTemporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: dirA)
+            try? FileManager.default.removeItem(at: dirB)
+        }
+        let manager = LearningManager(dictionaryURL: Self.resourceURL)
+
+        XCTAssertTrue(manager.updateConfig(self.getConfigForMemoryTest(memoryURL: dirA)))
+        XCTAssertFalse(manager.updateConfig(self.getConfigForMemoryTest(memoryURL: dirA)))
+        XCTAssertTrue(manager.updateConfig(self.getConfigForMemoryTest(memoryURL: dirB)))
+        XCTAssertTrue(manager.updateConfig(.init(learningType: .nothing, maxMemoryCount: 32, memoryURL: dirB)))
+    }
+
     func testCoarseForgetMemory() throws {
         // ForgetMemoryは「粗い」チェックを行うため、品詞が異なっていても同時に忘却される
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("LearningManagerPersistence-\(UUID().uuidString)", isDirectory: true)
