@@ -6,7 +6,7 @@
 //  Copyright © 2021 ensan. All rights reserved.
 //
 
-import Foundation
+public import Foundation
 import SwiftUtils
 
 private struct MetadataElement: CustomDebugStringConvertible {
@@ -226,10 +226,91 @@ struct LongTermLearningMemory {
         }
     }
 
+    /// 永続化済み学習メモリから、指定した読みに完全一致する行のキーを取得する。
+    ///
+    /// 変換経路がキャッシュしている memory LOUDS で各読みをノードインデックスへ解決し、
+    /// シャード別にまとめることで `memoryN.loudstxt3` を1呼び出しにつき高々1回しか読まない。
+    /// 一時記憶 (`TemporalLearningMemoryTrie`) は参照しない。
+    static func persistedLearningMemoryKeys(
+        directoryURL: URL,
+        louds: LOUDS,
+        char2UInt8: [Character: UInt8],
+        exactReadings: some Sequence<String>
+    ) throws -> [PersistedLearningMemoryKey] {
+        guard !fileExist(pauseFileURL(directoryURL: directoryURL)) else {
+            throw LearningMemoryEnumerationError.pausedSnapshot
+        }
+        var nodeIndices: Set<Int> = []
+        for reading in exactReadings where !reading.isEmpty {
+            // 未知文字を含む読みは trie に存在し得ないので、シャードI/Oなしで棄却する
+            guard let chars = LearningManager.keyToChars(reading, char2UInt8: char2UInt8),
+                  let nodeIndex = louds.searchNodeIndex(chars: chars) else {
+                continue
+            }
+            nodeIndices.insert(nodeIndex)
+        }
+        guard !nodeIndices.isEmpty else {
+            return []
+        }
+        var keys: [PersistedLearningMemoryKey] = []
+        let indicesByShard = [Int: [Int]](grouping: nodeIndices, by: { $0 >> DictionaryBuilder.shardShift })
+        for (shardIndex, indices) in indicesByShard {
+            let shardURL = loudsTxt3FileURL("\(shardIndex)", asTemporaryFile: false, directoryURL: directoryURL)
+            let shardData: Data
+            do {
+                shardData = try Data(contentsOf: shardURL)
+            } catch {
+                throw LearningMemoryEnumerationError.malformedShard
+            }
+            let rows = try LOUDS.parsePersistedMemoryRows(
+                binary: shardData,
+                localIndices: indices.map { $0 & DictionaryBuilder.localMask }
+            )
+            keys.append(
+                contentsOf: rows.map {
+                    PersistedLearningMemoryKey(reading: $0.ruby, word: $0.word, lcid: $0.lcid, rcid: $0.rcid)
+                }
+            )
+        }
+        return keys
+    }
+
     static func learningMemoryEntries(
         directoryURL: URL,
         offset: Int,
         limit: Int
+    ) throws -> LearningMemoryPage {
+        try scanLearningMemoryEntries(
+            directoryURL: directoryURL,
+            offset: offset,
+            limit: limit,
+            stoppingWhenPageIsFull: false
+        )
+    }
+
+    /// 永続化済み学習メモリを1回の走査でまとめて取得する。
+    ///
+    /// ページ版は `rowIndex == totalCount` を整合性チェックに使うため常に末尾まで走査し、
+    /// 全件取得がページ数に比例して O(N^2) になる。こちらは上限をそのまま `limit` として受け取り、
+    /// 満たした時点で走査を打ち切る。末尾まで到達した場合は整合性チェックを維持し、
+    /// 打ち切った場合はメタデータ上の `totalCount` を報告する。
+    static func learningMemoryEntriesSinglePass(
+        directoryURL: URL,
+        limit: Int
+    ) throws -> LearningMemoryPage {
+        try scanLearningMemoryEntries(
+            directoryURL: directoryURL,
+            offset: 0,
+            limit: limit,
+            stoppingWhenPageIsFull: true
+        )
+    }
+
+    private static func scanLearningMemoryEntries(
+        directoryURL: URL,
+        offset: Int,
+        limit: Int,
+        stoppingWhenPageIsFull: Bool
     ) throws -> LearningMemoryPage {
         guard offset >= 0 else {
             throw LearningMemoryEnumerationError.invalidOffset
@@ -255,8 +336,9 @@ struct LongTermLearningMemory {
         var entries: [LearningMemoryEntry] = []
         entries.reserveCapacity(pageRange.count)
         var rowIndex = 0
+        var stoppedEarly = false
 
-        for shardIndex in 0 ..< (metadataBlocks.count + txtFileSplit - 1) / txtFileSplit {
+        shardLoop: for shardIndex in 0 ..< (metadataBlocks.count + txtFileSplit - 1) / txtFileSplit {
             let shardURL = loudsTxt3FileURL("\(shardIndex)", asTemporaryFile: false, directoryURL: directoryURL)
             guard fileExist(shardURL) else {
                 throw LearningMemoryEnumerationError.malformedShard
@@ -298,10 +380,14 @@ struct LongTermLearningMemory {
                     }
                     rowIndex += 1
                 }
+                if stoppingWhenPageIsFull, rowIndex >= pageEnd, pageEnd < totalCount {
+                    stoppedEarly = true
+                    break shardLoop
+                }
             }
         }
 
-        guard rowIndex == totalCount else {
+        guard stoppedEarly || rowIndex == totalCount else {
             throw LearningMemoryEnumerationError.inconsistentSnapshot
         }
         let nextOffset = offset + entries.count < totalCount ? offset + entries.count : nil
@@ -782,6 +868,12 @@ public struct LearningConfig: Sendable, Equatable {
     var learningType: LearningType = .nothing
     var maxMemoryCount: Int = 0
     var memoryURL: URL?
+
+    public init(learningType: LearningType = .nothing, maxMemoryCount: Int = 0, memoryURL: URL? = nil) {
+        self.learningType = learningType
+        self.maxMemoryCount = maxMemoryCount
+        self.memoryURL = memoryURL
+    }
 }
 
 final class LearningManager {
@@ -1068,6 +1160,16 @@ final class LearningManager {
         return try LongTermLearningMemory.learningMemoryEntries(
             directoryURL: memoryURL,
             offset: offset,
+            limit: limit
+        )
+    }
+
+    func learningMemoryEntriesSinglePass(limit: Int) throws -> LearningMemoryPage {
+        guard let memoryURL = config.memoryURL else {
+            throw LearningMemoryEnumerationError.memoryDirectoryUnavailable
+        }
+        return try LongTermLearningMemory.learningMemoryEntriesSinglePass(
+            directoryURL: memoryURL,
             limit: limit
         )
     }

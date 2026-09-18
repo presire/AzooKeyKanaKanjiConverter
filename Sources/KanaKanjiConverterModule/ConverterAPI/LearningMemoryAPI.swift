@@ -28,6 +28,24 @@ public struct LearningMemoryPage: Sendable {
     }
 }
 
+/// 永続化済み学習メモリの1行を一意に識別するキーです。
+///
+/// 同じ (読み, 表記) でも接続ID (lcid/rcid) が異なる行は別エントリとして保存されるため、
+/// 削除やアノテーションを同一の照会結果から導けるよう接続IDまで含めます。
+public struct PersistedLearningMemoryKey: Sendable, Hashable {
+    public let reading: String
+    public let word: String
+    public let lcid: Int
+    public let rcid: Int
+
+    public init(reading: String, word: String, lcid: Int, rcid: Int) {
+        self.reading = reading
+        self.word = word
+        self.lcid = lcid
+        self.rcid = rcid
+    }
+}
+
 /// 学習メモリの列挙時に検出される永続化スナップショットのエラーです。
 public enum LearningMemoryEnumerationError: Error, Equatable, Sendable {
     case pausedSnapshot

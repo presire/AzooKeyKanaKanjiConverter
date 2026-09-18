@@ -163,12 +163,9 @@ public final class DicdataStore {
         if query == "memory" {
             if state.memoryHasLoaded {
                 return state.memoryLOUDS
-            } else if let memoryURL = state.memoryURL,
-                      let louds = LOUDS.loadMemory(memoryURL: memoryURL) {
-                state.updateMemoryLOUDS(louds)
+            } else if let louds = state.loadMemoryLOUDSIfNeeded() {
                 return louds
             } else {
-                state.updateMemoryLOUDS(nil)
                 debug("Error: ユーザ辞書のloudsファイルの読み込みに失敗しましたが、このエラーは深刻ではありません。")
             }
         }

@@ -57,6 +57,22 @@ package final class DicdataStoreState {
         self.memoryHasLoaded = true
     }
 
+    /// 永続学習メモリの LOUDS を読み込み、キャッシュする。
+    ///
+    /// 変換経路 (`DicdataStore.loadLOUDS(query: "memory", state:)`) と永続エントリの
+    /// ポイント照会が同一のキャッシュと同一の無効化を共有するための単一の入口。
+    func loadMemoryLOUDSIfNeeded() -> LOUDS? {
+        if self.memoryHasLoaded {
+            return self.memoryLOUDS
+        }
+        if let memoryURL = self.memoryURL, let louds = LOUDS.loadMemory(memoryURL: memoryURL) {
+            self.updateMemoryLOUDS(louds)
+            return louds
+        }
+        self.updateMemoryLOUDS(nil)
+        return nil
+    }
+
     func updateUserDictionaryLOUDS(_ newLOUDS: LOUDS?) {
         self.userDictionaryLOUDS = newLOUDS
         self.userDictionaryHasLoaded = true
@@ -150,6 +166,29 @@ package final class DicdataStoreState {
 
     func learningMemoryEntries(offset: Int, limit: Int) throws -> LearningMemoryPage {
         try self.learningMemoryManager.learningMemoryEntries(offset: offset, limit: limit)
+    }
+
+    func learningMemoryEntriesSinglePass(limit: Int) throws -> LearningMemoryPage {
+        try self.learningMemoryManager.learningMemoryEntriesSinglePass(limit: limit)
+    }
+
+    func persistedLearningMemoryKeys(exactReadings: [String]) throws -> [PersistedLearningMemoryKey] {
+        guard let memoryURL = self.memoryURL else {
+            throw LearningMemoryEnumerationError.memoryDirectoryUnavailable
+        }
+        guard let louds = self.loadMemoryLOUDSIfNeeded() else {
+            // LOUDS が無い場合でも、停止中のスナップショットは「未学習」と区別して報告する
+            guard !LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL) else {
+                throw LearningMemoryEnumerationError.pausedSnapshot
+            }
+            return []
+        }
+        return try LongTermLearningMemory.persistedLearningMemoryKeys(
+            directoryURL: memoryURL,
+            louds: louds,
+            char2UInt8: self.learningMemoryManager.char2UInt8,
+            exactReadings: exactReadings
+        )
     }
 
     // 学習を反映する

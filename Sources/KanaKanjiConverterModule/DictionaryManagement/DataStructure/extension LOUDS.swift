@@ -212,6 +212,77 @@ extension LOUDS {
         }
     }
 
+    /// 学習メモリのシャードから、指定したローカルインデックスの行だけを厳密に読み出す。
+    ///
+    /// `parseLoudstxt3Binary` と違い全オフセットを使用前に検証し、壊れたシャードでは
+    /// 配列境界でトラップせず `malformedShard` を throw する。永続化済み学習エントリの
+    /// 同定に必要なフィールドのみを復号する。
+    static func parsePersistedMemoryRows(
+        binary: borrowing Data,
+        localIndices: [Int]
+    ) throws -> [(ruby: String, word: String, lcid: Int, rcid: Int)] {
+        let total = binary.count
+        guard total >= MemoryLayout<UInt16>.size else {
+            throw LearningMemoryEnumerationError.malformedShard
+        }
+        let entryCount = Int(readUInt16LE(binary, 0))
+        let headerEnd = MemoryLayout<UInt16>.size + entryCount * MemoryLayout<UInt32>.size
+        guard headerEnd <= total else {
+            throw LearningMemoryEnumerationError.malformedShard
+        }
+        var rows: [(ruby: String, word: String, lcid: Int, rcid: Int)] = []
+        for index in localIndices {
+            guard (0 ..< entryCount).contains(index) else {
+                throw LearningMemoryEnumerationError.malformedShard
+            }
+            let start = Int(readUInt32LE(binary, MemoryLayout<UInt16>.size + index * MemoryLayout<UInt32>.size))
+            let end = index == entryCount - 1
+                ? total
+                : Int(readUInt32LE(binary, MemoryLayout<UInt16>.size + (index + 1) * MemoryLayout<UInt32>.size))
+            guard headerEnd <= start, start <= end, end <= total else {
+                throw LearningMemoryEnumerationError.malformedShard
+            }
+            rows.append(contentsOf: try parsePersistedMemoryEntry(binary: binary, range: start ..< end))
+        }
+        return rows
+    }
+
+    private static func parsePersistedMemoryEntry(
+        binary: borrowing Data,
+        range: Range<Int>
+    ) throws -> [(ruby: String, word: String, lcid: Int, rcid: Int)] {
+        guard range.count >= MemoryLayout<UInt16>.size else {
+            throw LearningMemoryEnumerationError.malformedShard
+        }
+        let rowCount = Int(readUInt16LE(binary, range.lowerBound))
+        // 1行あたり lcid/rcid/mid (UInt16 x3) + score (Float32) の10バイト
+        let numericBytes = rowCount * 10
+        let textStart = range.lowerBound + MemoryLayout<UInt16>.size + numericBytes
+        guard textStart <= range.upperBound else {
+            throw LearningMemoryEnumerationError.malformedShard
+        }
+        guard rowCount > 0 else {
+            return []
+        }
+        var cids: [(lcid: Int, rcid: Int)] = []
+        cids.reserveCapacity(rowCount)
+        for row in 0 ..< rowCount {
+            let base = range.lowerBound + MemoryLayout<UInt16>.size + row * 10
+            cids.append((Int(readUInt16LE(binary, base)), Int(readUInt16LE(binary, base + 2))))
+        }
+        let textRange = binary.index(binary.startIndex, offsetBy: textStart)
+            ..< binary.index(binary.startIndex, offsetBy: range.upperBound)
+        let fields = String(decoding: binary[textRange], as: UTF8.self)
+            .split(separator: "\t", omittingEmptySubsequences: false)
+        guard fields.count == rowCount + 1 else {
+            throw LearningMemoryEnumerationError.malformedShard
+        }
+        let ruby = String(fields[0])
+        return zip(cids, fields.dropFirst()).map { cid, field in
+            (ruby: ruby, word: field.isEmpty ? ruby : String(field), lcid: cid.lcid, rcid: cid.rcid)
+        }
+    }
+
     private static func parseLoudstxt3Binary(binary: borrowing Data, indices: [Int]) -> [DicdataElement] {
         let lc: Int = Int(readUInt16LE(binary, 0))
         // Header table of UInt32 offsets starts at byte 2

@@ -543,6 +543,24 @@ public final class KanaKanjiConverter {
         )
     }
 
+    /// 永続化済み学習メモリを1回の走査でまとめて取得します。
+    ///
+    /// `learningMemoryEntries(offset:limit:)` と異なり `limit` を丸めず、
+    /// 指定件数に達した時点で走査を打ち切ります。
+    public func allLearningMemoryEntries(limit: Int) throws -> LearningMemoryPage {
+        try self.dicdataStoreState.learningMemoryEntriesSinglePass(limit: max(limit, 0))
+    }
+
+    /// 永続化済み学習メモリから、指定した読みに完全一致するエントリのキーを取得します。
+    ///
+    /// 変換経路がキャッシュしている memory LOUDS を用いたポイント照会なので、
+    /// 保存件数に依存しません。一時記憶 (未永続化の学習) は含みません。
+    /// - Note: `memoryDirectoryURL` は `requestCandidates(_:options:)` の内部で遅延適用されるため、
+    ///   プロファイル切替直後は変換要求の**後**に呼ぶ必要があります。
+    public func persistedLearningMemoryKeys(exactReadings: [String]) throws -> [PersistedLearningMemoryKey] {
+        try self.dicdataStoreState.persistedLearningMemoryKeys(exactReadings: exactReadings)
+    }
+
     /// 確定操作後の学習メモリの更新を確定させます。
     public func resetMemory() {
         self.dicdataStoreState.resetMemory()

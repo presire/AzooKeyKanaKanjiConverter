@@ -113,6 +113,12 @@ final class LearningMemoryTests: XCTestCase {
         return dir
     }
 
+    private func persistElement(word: String, ruby: String, cid: Int, into state: DicdataStoreState) {
+        let element = DicdataElement(word: word, ruby: ruby, cid: cid, mid: MIDData.一般.mid, value: -10)
+        state.learningMemoryManager.update(data: [element])
+        state.learningMemoryManager.save()
+    }
+
     func testUpdateConfigReportsCacheResetOnlyWhenMemoryURLChanges() throws {
         let dirA = try makeTemporaryDirectory()
         let dirB = try makeTemporaryDirectory()
@@ -126,6 +132,119 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertFalse(manager.updateConfig(self.getConfigForMemoryTest(memoryURL: dirA)))
         XCTAssertTrue(manager.updateConfig(self.getConfigForMemoryTest(memoryURL: dirB)))
         XCTAssertTrue(manager.updateConfig(.init(learningType: .nothing, maxMemoryCount: 32, memoryURL: dirB)))
+    }
+
+    func testMemoryURLChangeInvalidatesCachedMemoryLOUDS() throws {
+        let dirA = try makeTemporaryDirectory()
+        let dirB = try makeTemporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: dirA)
+            try? FileManager.default.removeItem(at: dirB)
+        }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+
+        let stateA = dicdataStore.prepareState()
+        stateA.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dirA))
+        persistElement(word: "藍", ruby: "アイ", cid: CIDData.一般名詞.cid, into: stateA)
+
+        let stateB = dicdataStore.prepareState()
+        stateB.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dirB))
+        persistElement(word: "上", ruby: "ウエ", cid: CIDData.一般名詞.cid, into: stateB)
+
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dirA))
+        XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["アイ"]).map(\.word), ["藍"])
+
+        // 学習のコミットを挟まずにディレクトリだけを切り替える
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dirB))
+        XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["アイ"]), [])
+        XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["ウエ"]).map(\.word), ["上"])
+    }
+
+    func testPersistedLearningMemoryKeysReturnsEveryCidVariant() throws {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+
+        persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+        persistElement(word: "テスト", ruby: "テスト", cid: CIDData.固有名詞.cid, into: state)
+
+        let keys = try state.persistedLearningMemoryKeys(exactReadings: ["テスト"])
+        XCTAssertEqual(keys.count, 2)
+        XCTAssertTrue(keys.allSatisfy { $0.reading == "テスト" && $0.word == "テスト" })
+        XCTAssertEqual(
+            Set(keys.map(\.lcid)),
+            [CIDData.一般名詞.cid, CIDData.固有名詞.cid]
+        )
+    }
+
+    func testPersistedLearningMemoryKeysRejectsUnknownCharacterAndAbsentReading() throws {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+        persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+
+        // charID.chid に無い文字は trie に存在し得ないので、シャードを読まずに棄却される
+        XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["🍣"]), [])
+        XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["アイ"]), [])
+        XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: []), [])
+    }
+
+    func testPersistedLearningMemoryKeysIgnoresUncommittedTemporalMemory() throws {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+        persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+
+        let pending = DicdataElement(word: "未確定", ruby: "ミカクテイ", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+        state.learningMemoryManager.update(data: [pending])
+
+        XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["ミカクテイ"]), [])
+        XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["テスト"]).map(\.word), ["テスト"])
+    }
+
+    func testPersistedLearningMemoryKeysThrowsOnPausedSnapshot() throws {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+        persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+
+        let pauseURL = dir.appendingPathComponent(".pause", isDirectory: false)
+        FileManager.default.createFile(atPath: pauseURL.path, contents: Data())
+        defer { try? FileManager.default.removeItem(at: pauseURL) }
+
+        XCTAssertThrowsError(try state.persistedLearningMemoryKeys(exactReadings: ["テスト"])) { error in
+            XCTAssertEqual(error as? LearningMemoryEnumerationError, .pausedSnapshot)
+        }
+    }
+
+    func testSinglePassEnumerationHonorsLimitWithoutClamping() throws {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+        for ruby in ["アイ", "ウエ", "オカ"] {
+            persistElement(word: ruby, ruby: ruby, cid: CIDData.一般名詞.cid, into: state)
+        }
+
+        let all = try state.learningMemoryEntriesSinglePass(limit: 65_536)
+        XCTAssertEqual(all.entries.count, 3)
+        XCTAssertEqual(all.totalCount, 3)
+        XCTAssertNil(all.nextOffset)
+
+        let truncated = try state.learningMemoryEntriesSinglePass(limit: 2)
+        XCTAssertEqual(truncated.entries.count, 2)
+        XCTAssertEqual(truncated.totalCount, 3)
+        XCTAssertEqual(truncated.nextOffset, 2)
     }
 
     func testCoarseForgetMemory() throws {
