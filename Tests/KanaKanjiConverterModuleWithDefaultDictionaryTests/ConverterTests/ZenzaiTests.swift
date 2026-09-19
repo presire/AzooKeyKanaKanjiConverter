@@ -6,6 +6,18 @@ import XCTest
 
 #if Zenzai || ZenzaiCPU
 final class ZenzaiTests: XCTestCase {
+    private static let zenzaiWeightURL = URL(
+        fileURLWithPath: "/Library/Input Methods/azooKeyMac.app/Contents/Resources/ggml-model-Q5_K_M.gguf"
+    )
+
+    /// 重みが無い環境ではZenzaiが素の辞書変換へ縮退するため、推論結果を期待するテストは成立しない。
+    private func skipUnlessZenzaiWeightIsAvailable() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: Self.zenzaiWeightURL.path),
+            "Zenzai weight is not available at \(Self.zenzaiWeightURL.path)"
+        )
+    }
+
     private struct DesktopPredictionScenario {
         var label: String
         var leftSideContext: String
@@ -106,7 +118,7 @@ final class ZenzaiTests: XCTestCase {
             textReplacer: .empty,
             specialCandidateProviders: [],
             zenzaiMode: .on(
-                weight: URL(fileURLWithPath: "/Library/Input Methods/azooKeyMac.app/Contents/Resources/ggml-model-Q5_K_M.gguf"),
+                weight: Self.zenzaiWeightURL,
                 inferenceLimit: inferenceLimit,
                 personalizationMode: .none,
                 versionDependentMode: .v3(.init(leftSideContext: leftSideContext))
@@ -141,7 +153,7 @@ final class ZenzaiTests: XCTestCase {
             textReplacer: .withDefaultEmojiDictionary(),
             specialCandidateProviders: KanaKanjiConverter.defaultSpecialCandidateProviders,
             zenzaiMode: .on(
-                weight: URL(fileURLWithPath: "/Library/Input Methods/azooKeyMac.app/Contents/Resources/ggml-model-Q5_K_M.gguf"),
+                weight: Self.zenzaiWeightURL,
                 inferenceLimit: 5,
                 requestRichCandidates: false,
                 personalizationMode: .none,
@@ -184,9 +196,7 @@ final class ZenzaiTests: XCTestCase {
             textReplacer: .empty,
             specialCandidateProviders: [],
             zenzaiMode: .on(
-                weight: URL(
-                    fileURLWithPath: "/Library/Input Methods/azooKeyMac.app/Contents/Resources/ggml-model-Q5_K_M.gguf"
-                ),
+                weight: Self.zenzaiWeightURL,
                 inferenceLimit: 1,
                 personalizationMode: nil,
                 versionDependentMode: .v3(
@@ -265,6 +275,7 @@ final class ZenzaiTests: XCTestCase {
     }
 
     func testFullConversion() async throws {
+        try skipUnlessZenzaiWeightIsAvailable()
         // 各doブロックは独立した変換セッションである。同じ入力を繰り返すケースも、
         // 以前のConverterの変換結果キャッシュに依存せず再評価される必要がある。
         do {
@@ -304,8 +315,8 @@ final class ZenzaiTests: XCTestCase {
         }
     }
 
-    @MainActor
     func testGradualConversion_Roman2KanaDoesNotPromoteUnevaluatedDraft() throws {
+        try skipUnlessZenzaiWeightIsAvailable()
         let converter = KanaKanjiConverter.withDefaultDictionary()
         var options = self.requestOptions(inferenceLimit: 5)
         options.typoCorrectionMode = .disabled
@@ -321,8 +332,8 @@ final class ZenzaiTests: XCTestCase {
         XCTAssertEqual(result?.mainResults.first?.text, "水を飲むんだ")
     }
 
-    @MainActor
     func testGradualConversion() throws {
+        try skipUnlessZenzaiWeightIsAvailable()
         // 辞書は先に読み込んでおく（純粋な比較のため）
         let dicdataStore = DicdataStore.withDefaultDictionary(preloadDictionary: true)
         let profilesLatency = ProcessInfo.processInfo.environment["ZENZAI_PROFILE_LATENCY"] == "1"
@@ -353,8 +364,8 @@ final class ZenzaiTests: XCTestCase {
         }
     }
 
-    @MainActor
     func testGradualConversion_Roman2Kana() throws {
+        try skipUnlessZenzaiWeightIsAvailable()
         // 辞書は先に読み込んでおく（純粋な比較のため）
         let dicdataStore = DicdataStore.withDefaultDictionary(preloadDictionary: true)
         let profilesLatency = ProcessInfo.processInfo.environment["ZENZAI_PROFILE_LATENCY"] == "1"
@@ -385,8 +396,8 @@ final class ZenzaiTests: XCTestCase {
         }
     }
 
-    @MainActor
     func testGradualConversion_AZIK() throws {
+        try skipUnlessZenzaiWeightIsAvailable()
         // 辞書は先に読み込んでおく（純粋な比較のため）
         let dicdataStore = DicdataStore.withDefaultDictionary(preloadDictionary: true)
         let profilesLatency = ProcessInfo.processInfo.environment["ZENZAI_PROFILE_LATENCY"] == "1"
@@ -417,7 +428,6 @@ final class ZenzaiTests: XCTestCase {
         }
     }
 
-    @MainActor
     func testDesktopPredictiveInput_Roman2Kana() throws {
         // azooKeyDesktopの既定入力方式（Roman2Kana）で、予測入力を有効にしたまま
         // 1キーずつrequestCandidatesを呼ぶ実利用経路を測る。
@@ -483,6 +493,7 @@ final class ZenzaiTests: XCTestCase {
     }
 
     func testPrefixCandidateConstrainsFollowingConversion() throws {
+        try skipUnlessZenzaiWeightIsAvailable()
         // 予測候補を受け入れたあと、その読みまで入力を伸ばして変換すると、
         // 受け入れた候補の表記が第一候補になり、次の予測候補もその表記で始まる。
         // 素の変換では `かみの` は `上の`、`ひだり` は `左` になる。
@@ -598,7 +609,6 @@ final class ZenzaiTests: XCTestCase {
             .first { $0.text == text }
     }
 
-    @MainActor
     func testIOSDirectIncrementalInput() throws {
         let converter = KanaKanjiConverter.withDefaultDictionary()
         let options = self.iOSDirectInputOptions()
@@ -624,7 +634,6 @@ final class ZenzaiTests: XCTestCase {
         }
     }
 
-    @MainActor
     func testRepeatedCompositionMemoization() throws {
         // 実アプリでは同じKanaKanjiConverterを保持したまま、変換確定ごとに
         // stopComposition()を呼ぶ。純粋なメモ化結果はこの境界を跨いで再利用する
@@ -653,6 +662,7 @@ final class ZenzaiTests: XCTestCase {
     }
 
     func testTypoCorrection_OneShot_Roman2Kana() throws {
+        try skipUnlessZenzaiWeightIsAvailable()
         let converter = KanaKanjiConverter.withDefaultDictionary()
         var c = ComposingText()
         self.sequentialInput(&c, sequence: "ojsyougozainasu", inputStyle: .roman2kana)
@@ -669,7 +679,6 @@ final class ZenzaiTests: XCTestCase {
         )
     }
 
-    @MainActor
     func testGradualTypoCorrection_NGram() throws {
         // 通常のgradual conversionに加え、各prefixでLMベースのtypo探索を実行する。
         // 同一入力を繰り返してキャッシュを人工的にwarmにせず、実際に1文字ずつ
