@@ -16,12 +16,12 @@ final class LearningMemoryTests: XCTestCase {
         let manager = LearningManager(dictionaryURL: Self.resourceURL)
         _ = manager.updateConfig(self.getConfigForMemoryTest(memoryURL: dir))
 
-        XCTAssertFalse(manager.save())
+        XCTAssertFalse(try manager.save())
 
         let element = DicdataElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
         manager.update(data: [element])
-        XCTAssertTrue(manager.save())
-        XCTAssertFalse(manager.save())
+        XCTAssertTrue(try manager.save())
+        XCTAssertFalse(try manager.save())
     }
 
     func testPauseFileIsClearedOnInit() throws {
@@ -35,7 +35,7 @@ final class LearningMemoryTests: XCTestCase {
 
         let element = DicdataElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
         manager.update(data: [element])
-        manager.save()
+        try manager.save()
 
         // ポーズファイルを設置
         let pauseURL = dir.appendingPathComponent(".pause", isDirectory: false)
@@ -61,7 +61,7 @@ final class LearningMemoryTests: XCTestCase {
 
         let element = DicdataElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
         manager.update(data: [element])
-        manager.save()
+        try manager.save()
 
         let files = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
         XCTAssertTrue(files.contains { $0.lastPathComponent == "memory.louds" })
@@ -85,7 +85,7 @@ final class LearningMemoryTests: XCTestCase {
         _ = state.learningMemoryManager.updateConfig(config)
         let element = DicdataElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
         state.learningMemoryManager.update(data: [element])
-        state.learningMemoryManager.save()
+        try state.learningMemoryManager.save()
 
         let charIDs = "テスト".map { dicdataStore.character2charId($0) }
         let indices = dicdataStore.perfectMatchingSearch(query: "memory", charIDs: charIDs, state: state)
@@ -113,10 +113,10 @@ final class LearningMemoryTests: XCTestCase {
         return dir
     }
 
-    private func persistElement(word: String, ruby: String, cid: Int, into state: DicdataStoreState) {
+    private func persistElement(word: String, ruby: String, cid: Int, into state: DicdataStoreState) throws {
         let element = DicdataElement(word: word, ruby: ruby, cid: cid, mid: MIDData.一般.mid, value: -10)
         state.learningMemoryManager.update(data: [element])
-        state.learningMemoryManager.save()
+        try state.learningMemoryManager.save()
     }
 
     func testUpdateConfigReportsCacheResetOnlyWhenMemoryURLChanges() throws {
@@ -145,11 +145,11 @@ final class LearningMemoryTests: XCTestCase {
 
         let stateA = dicdataStore.prepareState()
         stateA.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dirA))
-        persistElement(word: "藍", ruby: "アイ", cid: CIDData.一般名詞.cid, into: stateA)
+        try persistElement(word: "藍", ruby: "アイ", cid: CIDData.一般名詞.cid, into: stateA)
 
         let stateB = dicdataStore.prepareState()
         stateB.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dirB))
-        persistElement(word: "上", ruby: "ウエ", cid: CIDData.一般名詞.cid, into: stateB)
+        try persistElement(word: "上", ruby: "ウエ", cid: CIDData.一般名詞.cid, into: stateB)
 
         let state = dicdataStore.prepareState()
         state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dirA))
@@ -168,8 +168,8 @@ final class LearningMemoryTests: XCTestCase {
         let state = dicdataStore.prepareState()
         state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
 
-        persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
-        persistElement(word: "テスト", ruby: "テスト", cid: CIDData.固有名詞.cid, into: state)
+        try persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+        try persistElement(word: "テスト", ruby: "テスト", cid: CIDData.固有名詞.cid, into: state)
 
         let keys = try state.persistedLearningMemoryKeys(exactReadings: ["テスト"])
         XCTAssertEqual(keys.count, 2)
@@ -186,7 +186,7 @@ final class LearningMemoryTests: XCTestCase {
         let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
         let state = dicdataStore.prepareState()
         state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
-        persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+        try persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
 
         // charID.chid に無い文字は trie に存在し得ないので、シャードを読まずに棄却される
         XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["🍣"]), [])
@@ -200,7 +200,7 @@ final class LearningMemoryTests: XCTestCase {
         let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
         let state = dicdataStore.prepareState()
         state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
-        persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+        try persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
 
         let pending = DicdataElement(word: "未確定", ruby: "ミカクテイ", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
         state.learningMemoryManager.update(data: [pending])
@@ -215,7 +215,7 @@ final class LearningMemoryTests: XCTestCase {
         let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
         let state = dicdataStore.prepareState()
         state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
-        persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+        try persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
 
         let pauseURL = dir.appendingPathComponent(".pause", isDirectory: false)
         FileManager.default.createFile(atPath: pauseURL.path, contents: Data())
@@ -233,7 +233,7 @@ final class LearningMemoryTests: XCTestCase {
         let state = dicdataStore.prepareState()
         state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
         for ruby in ["アイ", "ウエ", "オカ"] {
-            persistElement(word: ruby, ruby: ruby, cid: CIDData.一般名詞.cid, into: state)
+            try persistElement(word: ruby, ruby: ruby, cid: CIDData.一般名詞.cid, into: state)
         }
 
         let all = try state.learningMemoryEntriesSinglePass(limit: 65_536)
@@ -261,7 +261,7 @@ final class LearningMemoryTests: XCTestCase {
         state.learningMemoryManager.update(data: [element])
         let differentCidElement = DicdataElement(word: "テスト", ruby: "テスト", cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: -10)
         state.learningMemoryManager.update(data: [differentCidElement])
-        state.learningMemoryManager.save()
+        try state.learningMemoryManager.save()
 
         let charIDs = "テスト".map { dicdataStore.character2charId($0) }
         let indices = dicdataStore.perfectMatchingSearch(query: "memory", charIDs: charIDs, state: state)
@@ -282,5 +282,54 @@ final class LearningMemoryTests: XCTestCase {
         let indices2 = dicdataStore.perfectMatchingSearch(query: "memory", charIDs: charIDs, state: state)
         let dicdata2 = dicdataStore.getDicdataFromLoudstxt3(identifier: "memory", indices: indices2, state: state)
         XCTAssertFalse(dicdata2.contains { $0.word == element.word && $0.ruby == element.ruby })
+    }
+
+    func testSavePropagatesWriteFailureAndRetainsPendingMemory() throws {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+
+        let element = DicdataElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+        state.learningMemoryManager.update(data: [element])
+
+        // 書き込み失敗を起こすため、メモリディレクトリを同パスの通常ファイルに置き換える (ENOTDIR)
+        try FileManager.default.removeItem(at: dir)
+        FileManager.default.createFile(atPath: dir.path, contents: Data())
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        XCTAssertThrowsError(try state.learningMemoryManager.save())
+
+        // ディレクトリを復旧し、同じマネージャで再保存すると成功する (pending が保持されていた証明)
+        try FileManager.default.removeItem(at: dir)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        XCTAssertTrue(try state.learningMemoryManager.save())
+
+        let keys = try state.persistedLearningMemoryKeys(exactReadings: ["テスト"])
+        XCTAssertFalse(keys.isEmpty)
+        XCTAssertTrue(keys.contains { $0.word == "テスト" })
+    }
+
+    func testPersistedLearningMemoryKeysThrowsMalformedShardWhenShardIsMissing() throws {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+        try persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+
+        // memory0.loudstxt3 のみ削除し、他ファイルは残す
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("memory0.loudstxt3", isDirectory: false))
+
+        // LOUDS をディスクから読み直すため、新しい state で照会する
+        let freshState = dicdataStore.prepareState()
+        freshState.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+        XCTAssertThrowsError(try freshState.persistedLearningMemoryKeys(exactReadings: ["テスト"])) { error in
+            XCTAssertEqual(error as? LearningMemoryEnumerationError, .malformedShard)
+        }
     }
 }

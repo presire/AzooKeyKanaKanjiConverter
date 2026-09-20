@@ -519,8 +519,8 @@ public final class KanaKanjiConverter {
     }
 
     /// 確定操作後の学習メモリの更新を確定させます。
-    public func commitUpdateLearningData() {
-        self.dicdataStoreState.saveMemory()
+    public func commitUpdateLearningData() throws {
+        try self.dicdataStoreState.saveMemory()
     }
 
     /// 確定操作後の学習メモリの更新を確定させます。

@@ -1175,7 +1175,7 @@ final class LearningManager {
     }
 
     @discardableResult
-    func save() -> Bool {
+    func save() throws -> Bool {
         guard self.config.learningType.needUpdateMemory,
               let memoryURL = config.memoryURL else {
             debug(#function, "config.learningType=\(self.config.learningType as _?)", "skip memory update")
@@ -1185,16 +1185,13 @@ final class LearningManager {
             debug(#function, "skip because there is no pending memory")
             return false
         }
-        do {
-            try LongTermLearningMemory.merge(tempTrie: self.temporaryMemory, directoryURL: memoryURL, maxMemoryCount: self.config.maxMemoryCount, char2UInt8: char2UInt8)
-            // マージが済んだので、temporaryMemoryを空にする
-            self.temporaryMemory = TemporalLearningMemoryTrie()
-        } catch {
-            // アップデートに失敗した場合、そのまま諦める。
-            debug("LearningManager save: Failed to save LongTermLearningMemory", error)
+        // 成功・失敗のいずれでも破壊状態の判定を更新する。失敗時は pending の一時記憶を保持したまま再送出する。
+        defer {
+            self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
         }
-        // 状態を更新する
-        self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
+        // マージが済んだ場合のみ temporaryMemory を空にする。失敗時は保持して再送出する。
+        try LongTermLearningMemory.merge(tempTrie: self.temporaryMemory, directoryURL: memoryURL, maxMemoryCount: self.config.maxMemoryCount, char2UInt8: char2UInt8)
+        self.temporaryMemory = TemporalLearningMemoryTrie()
         return true
     }
 

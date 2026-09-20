@@ -143,8 +143,8 @@ package final class DicdataStoreState {
         self.memoryHasLoaded = false
     }
 
-    func saveMemory() {
-        if self.learningMemoryManager.save() {
+    func saveMemory() throws {
+        if try self.learningMemoryManager.save() {
             self.resetMemoryLOUDSCache()
         }
     }

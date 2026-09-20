@@ -194,7 +194,7 @@ package struct AncoSession {
         case .save:
             self.composingText.stopComposition()
             self.converter.stopComposition()
-            self.converter.commitUpdateLearningData()
+            try self.converter.commitUpdateLearningData()
             let message = self.requestOptionsState.learningType.needUpdateMemory
                 ? "saved"
                 : "anything should not be saved because the learning type is not for update memory"
