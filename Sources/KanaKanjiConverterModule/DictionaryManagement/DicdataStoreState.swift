@@ -25,7 +25,12 @@ package final class DicdataStoreState {
 
     private(set) var memoryHasLoaded: Bool = false
     private(set) var memoryLOUDS: LOUDS?
+    private(set) var supplementalDictionaryEnabled: Bool = true
     private var staticConversionCacheEligibility: Bool?
+
+    func updateSupplementalDictionaryEnabled(_ enabled: Bool) {
+        self.supplementalDictionaryEnabled = enabled
+    }
 
     func updateUserDictionaryURL(_ newURL: URL, forceReload: Bool) {
         if self.userDictionaryURL != newURL || forceReload {

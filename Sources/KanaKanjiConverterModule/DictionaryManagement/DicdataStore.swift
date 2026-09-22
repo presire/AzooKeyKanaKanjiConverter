@@ -11,8 +11,12 @@ public import Foundation
 import SwiftUtils
 
 public final class DicdataStore {
-    public init(dictionaryURL: URL, preloadDictionary: Bool = false) {
+    /// `supplementalDictionaryURL`は読み取り専用の補助辞書のディレクトリ。`louds/`のみを持ち、
+    /// `cb/`・`mm.binary`はシステム辞書のものを共有する。`louds/charID.chid`にはビルド時に用いた
+    /// システム辞書の`charID.chid`と同一内容を照合用スタンプとして置く。一致しなければ補助辞書のみ無効化する。
+    public init(dictionaryURL: URL, supplementalDictionaryURL: URL? = nil, preloadDictionary: Bool = false) {
         self.dictionaryURL = dictionaryURL
+        self.supplementalDictionaryURL = supplementalDictionaryURL
         self.setup(preloadDictionary: preloadDictionary)
     }
 
@@ -35,6 +39,27 @@ public final class DicdataStore {
     private let cidCount = 1319
 
     private let dictionaryURL: URL
+    private var supplementalDictionaryURL: URL?
+
+    public var hasSupplementalDictionary: Bool {
+        self.supplementalDictionaryURL != nil
+    }
+
+    static let supplementalQueryPrefix = "supplemental:"
+
+    static func supplementalQuery(_ identifier: some StringProtocol) -> String {
+        Self.supplementalQueryPrefix + identifier
+    }
+
+    static func supplementalIdentifier(from query: String) -> String? {
+        query.hasPrefix(Self.supplementalQueryPrefix)
+            ? String(query.dropFirst(Self.supplementalQueryPrefix.count))
+            : nil
+    }
+
+    func supplementalDictionaryIsUsable(state: DicdataStoreState) -> Bool {
+        self.supplementalDictionaryURL != nil && state.supplementalDictionaryEnabled
+    }
 
     private let numberFormatter = NumberFormatter()
     /// 初期化時のセットアップ用の関数。プロパティリストを読み込み、連接確率リストを読み込んで行分割し保存しておく。
@@ -58,8 +83,35 @@ public final class DicdataStore {
                 self.mmValue = [PValue].init(repeating: .zero, count: self.midCount * self.midCount)
             }
         }
+        self.validateSupplementalDictionary()
         if preloadDictionary {
             self.preloadDictionary()
+        }
+    }
+
+    /// 補助辞書の`louds/charID.chid`がシステム辞書と一致しなければ無効化する。
+    /// 不一致のまま引くと、同じノードindexが別の文字列を指すため無関係な語が出る。
+    private func validateSupplementalDictionary() {
+        guard let supplementalDictionaryURL else {
+            return
+        }
+        do {
+            let systemCharID = try String(
+                contentsOf: self.dictionaryURL.appendingPathComponent("louds/charID.chid", isDirectory: false),
+                encoding: String.Encoding.utf8
+            )
+            let supplementalCharID = try String(
+                contentsOf: supplementalDictionaryURL.appendingPathComponent("louds/charID.chid", isDirectory: false),
+                encoding: String.Encoding.utf8
+            )
+            guard systemCharID == supplementalCharID else {
+                debug("Error: 補助辞書のcharID.chidがシステム辞書と一致しないため、補助辞書を無効化します。")
+                self.supplementalDictionaryURL = nil
+                return
+            }
+        } catch {
+            debug("Error: 補助辞書のcharID.chidを読み込めないため、補助辞書を無効化します。Description: \(error)")
+            self.supplementalDictionaryURL = nil
         }
     }
 
@@ -136,6 +188,24 @@ public final class DicdataStore {
     }
 
     func loadLOUDS(query: String, state: DicdataStoreState) -> LOUDS? {
+        if let supplementalIdentifier = Self.supplementalIdentifier(from: query) {
+            guard self.supplementalDictionaryIsUsable(state: state),
+                  let supplementalDictionaryURL = self.supplementalDictionaryURL else {
+                return nil
+            }
+            if self.importedLoudses.contains(query) {
+                return self.loudses[query]
+            }
+            let identifier = DictionaryBuilder.escapedIdentifier(supplementalIdentifier)
+            self.importedLoudses.insert(query)
+            if let louds = LOUDS.load(identifier, dictionaryURL: supplementalDictionaryURL) {
+                self.loudses[query] = louds
+                return louds
+            } else {
+                debug("Error: 補助辞書のID「\(identifier)」のloudsファイルが存在しません。補助辞書に当該の先頭文字が収録されていない場合、このエラーは深刻ではありません。")
+                return nil
+            }
+        }
         if query == "user" {
             if state.userDictionaryHasLoaded {
                 return state.userDictionaryLOUDS
@@ -316,6 +386,7 @@ public final class DicdataStore {
             )
             generator.register(typoCorrectionGenerator)
         }
+        let useSupplemental = self.supplementalDictionaryIsUsable(state: state)
         var targetLOUDS: [String: LOUDS.MovingTowardPrefixSearchHelper] = [:]
         var stringToInfo: [([Character], (endIndex: Lattice.LatticeIndex, penalty: PValue))] = []
         // 動的辞書（一時学習データ、動的ユーザ辞書）から取り出されたデータ
@@ -326,10 +397,12 @@ public final class DicdataStore {
                 continue
             }
             let charIDs = characters.map(self.character2charId(_:))
-            let keys: [String] = if useMemory {
-                [String(firstCharacter), "user", "memory"]
-            } else {
-                [String(firstCharacter), "user"]
+            var keys: [String] = [String(firstCharacter), "user"]
+            if useMemory {
+                keys.append("memory")
+            }
+            if useSupplemental {
+                keys.append(Self.supplementalQuery(String(firstCharacter)))
             }
             var updated = false
             var availableMaxIndex = 0
@@ -439,6 +512,24 @@ public final class DicdataStore {
         // Group indices by shard
         let dict = [Int: [Int]].init(grouping: indices, by: { $0 >> DictionaryBuilder.shardShift })
         var data: [DicdataElement] = []
+        if let supplementalIdentifier = Self.supplementalIdentifier(from: identifier) {
+            guard self.supplementalDictionaryIsUsable(state: state),
+                  let supplementalDictionaryURL = self.supplementalDictionaryURL else {
+                return []
+            }
+            let escaped = DictionaryBuilder.escapedIdentifier(supplementalIdentifier)
+            for (key, value) in dict {
+                // キャッシュキーはシステム辞書と衝突させない。同じ先頭文字でもノードindexの意味が異なる。
+                let fileID = "\(escaped)\(key)"
+                data.append(contentsOf: LOUDS.getDataForLoudstxt3(
+                    fileID,
+                    indices: value.map { $0 & DictionaryBuilder.localMask },
+                    cache: self.loudstxts[Self.supplementalQuery(fileID)],
+                    dictionaryURL: supplementalDictionaryURL
+                ))
+            }
+            return data
+        }
         if identifier == "user", let userDictionaryURL = state.userDictionaryURL {
             for (key, value) in dict {
                 let fileID = "\(identifier)\(key)"
@@ -689,6 +780,17 @@ public final class DicdataStore {
             }
             result.append(contentsOf: self.getDicdataFromLoudstxt3(identifier: "memory", indices: Set(consume memoryDictIndices), state: state))
             result.append(contentsOf: state.learningMemoryManager.temporaryPrefixMatch(charIDs: charIDs))
+        }
+        if self.supplementalDictionaryIsUsable(state: state) {
+            let supplementalQuery = Self.supplementalQuery(first)
+            var supplementalIndices = self.startingFromPrefixSearch(query: supplementalQuery, charIDs: charIDs, depth: depth, maxCount: maxCount, state: state)
+            if includeExactMatch, supplementalIndices.count < maxCount {
+                supplementalIndices.append(contentsOf: self.perfectMatchingSearch(query: supplementalQuery, charIDs: charIDs, state: state))
+            }
+            result.append(
+                contentsOf: self.getDicdataFromLoudstxt3(identifier: supplementalQuery, indices: Set(consume supplementalIndices), state: state)
+                    .filter { Self.predictionUsable[$0.rcid] }
+            )
         }
         return result
     }

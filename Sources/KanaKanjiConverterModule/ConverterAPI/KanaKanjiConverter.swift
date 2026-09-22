@@ -40,8 +40,12 @@ public final class KanaKanjiConverter {
         self.converter = .init(dicdataStore: dicdataStore)
         self.dicdataStoreState = dicdataStore.prepareState()
     }
-    public convenience init(dictionaryURL: URL, preloadDictionary: Bool = false) {
-        let dicdataStore = DicdataStore(dictionaryURL: dictionaryURL, preloadDictionary: preloadDictionary)
+    public convenience init(dictionaryURL: URL, supplementalDictionaryURL: URL? = nil, preloadDictionary: Bool = false) {
+        let dicdataStore = DicdataStore(
+            dictionaryURL: dictionaryURL,
+            supplementalDictionaryURL: supplementalDictionaryURL,
+            preloadDictionary: preloadDictionary
+        )
         self.init(dicdataStore: dicdataStore)
     }
     static func withoutDictionary() -> KanaKanjiConverter {
@@ -434,6 +438,15 @@ public final class KanaKanjiConverter {
 
     public func updateLearningConfig(_ newConfig: LearningConfig) {
         self.dicdataStoreState.updateLearningConfig(newConfig)
+    }
+
+    /// 補助辞書が利用可能かどうか。ディレクトリ欠落や`charID.chid`不一致で無効化された場合は`false`。
+    public var isSupplementalDictionaryAvailable: Bool {
+        self.converter.dicdataStore.hasSupplementalDictionary
+    }
+
+    public func setSupplementalDictionaryEnabled(_ enabled: Bool) {
+        self.dicdataStoreState.updateSupplementalDictionaryEnabled(enabled)
     }
 
     /// 確定操作後、内部状態のキャッシュを変更する関数。

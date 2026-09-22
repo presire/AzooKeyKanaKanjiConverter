@@ -99,7 +99,14 @@ extension LOUDS {
     @inlinable
     static func parseBinary(binary: borrowing Data) -> [DicdataElement] {
         // Fast parse without intermediate toArray allocations
+        // 破損・切り詰められたシャードでも読み出しをトラップさせず空で縮退する
+        guard binary.count >= 2 else {
+            return []
+        }
         let count = Int(readUInt16LE(binary, 0))
+        guard binary.count >= 2 + count * 10 else {
+            return []
+        }
         var offset = 2
         var dicdata: [DicdataElement] = []
         dicdata.reserveCapacity(count)
@@ -135,6 +142,9 @@ extension LOUDS {
                     if isFirstField {
                         let rb = UnsafeBufferPointer(start: ptr + startInt, count: length)
                         ruby = String(decoding: rb, as: UTF8.self)
+                    } else if i >= dicdata.endIndex {
+                        // 宣言件数より多くの表層フィールドを持つ破損データで添字超過を避ける
+                        return
                     } else if isEmptyField {
                         withMutableValue(&dicdata[i]) {
                             $0.ruby = ruby
@@ -284,16 +294,30 @@ extension LOUDS {
     }
 
     private static func parseLoudstxt3Binary(binary: borrowing Data, indices: [Int]) -> [DicdataElement] {
+        // 破損・切り詰められたシャードでも読み出しをトラップさせず空で縮退する
+        guard binary.count >= 2 else {
+            return []
+        }
         let lc: Int = Int(readUInt16LE(binary, 0))
         // Header table of UInt32 offsets starts at byte 2
+        let payloadStart = 2 + lc * 4
+        guard lc > 0, binary.count >= payloadStart else {
+            return []
+        }
         var out: [DicdataElement] = []
         out.reserveCapacity(indices.count * 2) // rough guess
         for idx in indices {
+            guard idx >= 0, idx < lc else {
+                continue
+            }
             let start = Int(readUInt32LE(binary, 2 + idx * 4))
             let end: Int = if idx == (lc - 1) {
                 binary.endIndex
             } else {
                 Int(readUInt32LE(binary, 2 + (idx + 1) * 4))
+            }
+            guard start >= payloadStart, start <= end, end <= binary.endIndex else {
+                continue
             }
             out.append(contentsOf: parseBinary(binary: binary[start ..< end]))
         }
