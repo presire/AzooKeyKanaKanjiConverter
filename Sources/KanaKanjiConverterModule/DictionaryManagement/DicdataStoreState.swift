@@ -2,8 +2,9 @@ import Foundation
 import SwiftUtils
 
 package final class DicdataStoreState {
-    init(dictionaryURL: URL) {
+    init(dictionaryURL: URL, supplementalSourceIDs: [String] = []) {
         self.learningMemoryManager = LearningManager(dictionaryURL: dictionaryURL)
+        self.supplementalSourceIDs = supplementalSourceIDs
     }
 
     var keyboardLanguage: KeyboardLanguage = .ja_JP
@@ -25,11 +26,32 @@ package final class DicdataStoreState {
 
     private(set) var memoryHasLoaded: Bool = false
     private(set) var memoryLOUDS: LOUDS?
-    private(set) var supplementalDictionaryEnabled: Bool = true
+    /// `DicdataStore`に登録された補助辞書のID (宣言順)。
+    private let supplementalSourceIDs: [String]
+    /// 補助辞書ごとの有効フラグ。未設定のIDは有効として扱う。
+    private var supplementalDictionaryEnabledByID: [String: Bool] = [:]
     private var staticConversionCacheEligibility: Bool?
 
+    func isSupplementalDictionaryEnabled(_ id: String) -> Bool {
+        self.supplementalDictionaryEnabledByID[id] ?? true
+    }
+
+    /// 登録済みのIDに限り有効フラグを更新する。未知のIDでは何もせず`false`を返す。
+    @discardableResult
+    func updateSupplementalDictionaryEnabled(_ enabled: Bool, for id: String) -> Bool {
+        guard self.supplementalSourceIDs.contains(id) else {
+            return false
+        }
+        self.supplementalDictionaryEnabledByID[id] = enabled
+        return true
+    }
+
+    /// 先頭の補助辞書の有効フラグを更新する互換窓口。
     func updateSupplementalDictionaryEnabled(_ enabled: Bool) {
-        self.supplementalDictionaryEnabled = enabled
+        guard let firstID = self.supplementalSourceIDs.first else {
+            return
+        }
+        self.updateSupplementalDictionaryEnabled(enabled, for: firstID)
     }
 
     func updateUserDictionaryURL(_ newURL: URL, forceReload: Bool) {

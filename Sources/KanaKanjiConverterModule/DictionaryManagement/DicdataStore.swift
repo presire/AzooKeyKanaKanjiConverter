@@ -10,13 +10,74 @@ import Algorithms
 public import Foundation
 import SwiftUtils
 
+/// 読み取り専用の補助辞書の定義。
+///
+/// `directoryURL`は`louds/`のみを持ち、`cb/`・`mm.binary`はシステム辞書のものを共有する。
+/// `louds/charID.chid`にはビルド時に用いたシステム辞書の`charID.chid`と同一内容を照合用スタンプとして置く。
+/// 一致しなければそのソースのみ無効化する。
+public struct SupplementalDictionarySource: Sendable, Equatable {
+    /// キャッシュの名前空間に用いる安定ID。小文字英数字と`_`・`-`のみ。
+    public let id: String
+    public let directoryURL: URL?
+
+    public init(id: String, directoryURL: URL?) {
+        self.id = id
+        self.directoryURL = directoryURL
+    }
+}
+
+public enum SupplementalDictionaryConfigurationError: Error, Equatable, Sendable {
+    case emptySources
+    case duplicateID(String)
+    case invalidID(String)
+}
+
 public final class DicdataStore {
-    /// `supplementalDictionaryURL`は読み取り専用の補助辞書のディレクトリ。`louds/`のみを持ち、
-    /// `cb/`・`mm.binary`はシステム辞書のものを共有する。`louds/charID.chid`にはビルド時に用いた
-    /// システム辞書の`charID.chid`と同一内容を照合用スタンプとして置く。一致しなければ補助辞書のみ無効化する。
-    public init(dictionaryURL: URL, supplementalDictionaryURL: URL? = nil, preloadDictionary: Bool = false) {
+    /// 補助辞書を宣言順に登録する。空・ID重複・不正IDは`SupplementalDictionaryConfigurationError`で拒否する。
+    /// 各ソースは個別に検証され、失敗したソースのみ無効化される。
+    public convenience init(
+        dictionaryURL: URL,
+        supplementalDictionaries: [SupplementalDictionarySource],
+        preloadDictionary: Bool = false
+    ) throws {
+        guard !supplementalDictionaries.isEmpty else {
+            throw SupplementalDictionaryConfigurationError.emptySources
+        }
+        var seenIDs: Set<String> = []
+        for source in supplementalDictionaries {
+            guard Self.isValidSupplementalSourceID(source.id) else {
+                throw SupplementalDictionaryConfigurationError.invalidID(source.id)
+            }
+            guard seenIDs.insert(source.id).inserted else {
+                throw SupplementalDictionaryConfigurationError.duplicateID(source.id)
+            }
+        }
+        self.init(
+            dictionaryURL: dictionaryURL,
+            validatedSupplementalSources: Self.validateSupplementalSources(supplementalDictionaries, systemDictionaryURL: dictionaryURL),
+            preloadDictionary: preloadDictionary
+        )
+    }
+
+    /// `supplementalDictionaryURL`は読み取り専用の補助辞書のディレクトリ。
+    /// ID`legacy`の単一の補助辞書ソースとして扱う。
+    public convenience init(dictionaryURL: URL, supplementalDictionaryURL: URL? = nil, preloadDictionary: Bool = false) {
+        self.init(
+            dictionaryURL: dictionaryURL,
+            validatedSupplementalSources: Self.validateSupplementalSources(
+                [SupplementalDictionarySource(id: Self.legacySupplementalSourceID, directoryURL: supplementalDictionaryURL)],
+                systemDictionaryURL: dictionaryURL
+            ),
+            preloadDictionary: preloadDictionary
+        )
+    }
+
+    private init(dictionaryURL: URL, validatedSupplementalSources: [ValidatedSupplementalSource], preloadDictionary: Bool) {
         self.dictionaryURL = dictionaryURL
-        self.supplementalDictionaryURL = supplementalDictionaryURL
+        self.supplementalSources = validatedSupplementalSources
+        self.supplementalSourceIndexByID = Dictionary(
+            uniqueKeysWithValues: validatedSupplementalSources.enumerated().map { ($0.element.id, $0.offset) }
+        )
         self.setup(preloadDictionary: preloadDictionary)
     }
 
@@ -39,26 +100,67 @@ public final class DicdataStore {
     private let cidCount = 1319
 
     private let dictionaryURL: URL
-    private var supplementalDictionaryURL: URL?
 
+    struct ValidatedSupplementalSource {
+        let id: String
+        /// 検証を通過した場合のみ非nil。
+        let directoryURL: URL?
+
+        var isUsable: Bool {
+            self.directoryURL != nil
+        }
+    }
+
+    /// 構築時に固定される。実行時のトグルは`DicdataStoreState`側のID別フラグで行い、この配列は変更しない。
+    private let supplementalSources: [ValidatedSupplementalSource]
+    private let supplementalSourceIndexByID: [String: Int]
+
+    static let legacySupplementalSourceID = "legacy"
+
+    /// 先頭の補助辞書ソースが利用可能かどうか。
     public var hasSupplementalDictionary: Bool {
-        self.supplementalDictionaryURL != nil
+        self.supplementalSources.first?.isUsable ?? false
+    }
+
+    /// 登録済みかつ検証済みであれば`true`。実行時の有効/無効には依存しない。
+    public func isSupplementalDictionaryAvailable(for id: String) -> Bool {
+        self.supplementalSourceIndexByID[id].map { self.supplementalSources[$0].isUsable } ?? false
+    }
+
+    static func isValidSupplementalSourceID(_ id: String) -> Bool {
+        !id.isEmpty && id.unicodeScalars.allSatisfy {
+            ("a" ... "z").contains($0) || ("0" ... "9").contains($0) || $0 == "_" || $0 == "-"
+        }
     }
 
     static let supplementalQueryPrefix = "supplemental:"
 
+    /// 補助辞書のクエリ`supplemental:<id>:<identifier>`を作る。`loudses`・`loudstxts`のキャッシュキーもこの完全な形を用いる。
+    static func supplementalQuery(_ identifier: some StringProtocol, sourceID: String) -> String {
+        Self.supplementalQueryPrefix + sourceID + ":" + identifier
+    }
+
     static func supplementalQuery(_ identifier: some StringProtocol) -> String {
-        Self.supplementalQueryPrefix + identifier
+        Self.supplementalQuery(identifier, sourceID: Self.legacySupplementalSourceID)
     }
 
-    static func supplementalIdentifier(from query: String) -> String? {
-        query.hasPrefix(Self.supplementalQueryPrefix)
-            ? String(query.dropFirst(Self.supplementalQueryPrefix.count))
-            : nil
+    private func supplementalSourceIsUsable(_ source: ValidatedSupplementalSource, state: DicdataStoreState) -> Bool {
+        source.isUsable && state.isSupplementalDictionaryEnabled(source.id)
     }
 
-    func supplementalDictionaryIsUsable(state: DicdataStoreState) -> Bool {
-        self.supplementalDictionaryURL != nil && state.supplementalDictionaryEnabled
+    /// 補助辞書のクエリを、利用可能なソースのディレクトリとソース内の識別子へ解決する。
+    /// 未知のID、検証失敗、無効化中のいずれかであれば`nil`。
+    private func usableSupplementalTarget(of query: String, state: DicdataStoreState) -> (sourceID: String, directoryURL: URL, identifier: String)? {
+        let body = query.dropFirst(Self.supplementalQueryPrefix.count)
+        guard let separator = body.firstIndex(of: ":"),
+              let index = self.supplementalSourceIndexByID[String(body[..<separator])] else {
+            return nil
+        }
+        let source = self.supplementalSources[index]
+        guard self.supplementalSourceIsUsable(source, state: state), let directoryURL = source.directoryURL else {
+            return nil
+        }
+        return (source.id, directoryURL, String(body[body.index(after: separator)...]))
     }
 
     private let numberFormatter = NumberFormatter()
@@ -83,35 +185,39 @@ public final class DicdataStore {
                 self.mmValue = [PValue].init(repeating: .zero, count: self.midCount * self.midCount)
             }
         }
-        self.validateSupplementalDictionary()
         if preloadDictionary {
             self.preloadDictionary()
         }
     }
 
-    /// 補助辞書の`louds/charID.chid`がシステム辞書と一致しなければ無効化する。
+    /// 各補助辞書の`louds/charID.chid`がシステム辞書と一致しなければ、そのソースのみ無効化する。
     /// 不一致のまま引くと、同じノードindexが別の文字列を指すため無関係な語が出る。
-    private func validateSupplementalDictionary() {
-        guard let supplementalDictionaryURL else {
-            return
-        }
-        do {
-            let systemCharID = try String(
-                contentsOf: self.dictionaryURL.appendingPathComponent("louds/charID.chid", isDirectory: false),
-                encoding: String.Encoding.utf8
-            )
-            let supplementalCharID = try String(
-                contentsOf: supplementalDictionaryURL.appendingPathComponent("louds/charID.chid", isDirectory: false),
-                encoding: String.Encoding.utf8
-            )
-            guard systemCharID == supplementalCharID else {
-                debug("Error: 補助辞書のcharID.chidがシステム辞書と一致しないため、補助辞書を無効化します。")
-                self.supplementalDictionaryURL = nil
-                return
+    private static func validateSupplementalSources(
+        _ sources: [SupplementalDictionarySource],
+        systemDictionaryURL: URL
+    ) -> [ValidatedSupplementalSource] {
+        sources.map { source in
+            guard let directoryURL = source.directoryURL else {
+                return ValidatedSupplementalSource(id: source.id, directoryURL: nil)
             }
-        } catch {
-            debug("Error: 補助辞書のcharID.chidを読み込めないため、補助辞書を無効化します。Description: \(error)")
-            self.supplementalDictionaryURL = nil
+            do {
+                let systemCharID = try String(
+                    contentsOf: systemDictionaryURL.appendingPathComponent("louds/charID.chid", isDirectory: false),
+                    encoding: String.Encoding.utf8
+                )
+                let supplementalCharID = try String(
+                    contentsOf: directoryURL.appendingPathComponent("louds/charID.chid", isDirectory: false),
+                    encoding: String.Encoding.utf8
+                )
+                guard systemCharID == supplementalCharID else {
+                    debug("Error: 補助辞書「\(source.id)」のcharID.chidがシステム辞書と一致しないため、この補助辞書を無効化します。")
+                    return ValidatedSupplementalSource(id: source.id, directoryURL: nil)
+                }
+            } catch {
+                debug("Error: 補助辞書「\(source.id)」のcharID.chidを読み込めないため、この補助辞書を無効化します。Description: \(error)")
+                return ValidatedSupplementalSource(id: source.id, directoryURL: nil)
+            }
+            return ValidatedSupplementalSource(id: source.id, directoryURL: directoryURL)
         }
     }
 
@@ -146,7 +252,7 @@ public final class DicdataStore {
     }
 
     package func prepareState() -> DicdataStoreState {
-        .init(dictionaryURL: self.dictionaryURL)
+        .init(dictionaryURL: self.dictionaryURL, supplementalSourceIDs: self.supplementalSources.map(\.id))
     }
 
     func character2charId(_ character: Character) -> UInt8 {
@@ -188,17 +294,16 @@ public final class DicdataStore {
     }
 
     func loadLOUDS(query: String, state: DicdataStoreState) -> LOUDS? {
-        if let supplementalIdentifier = Self.supplementalIdentifier(from: query) {
-            guard self.supplementalDictionaryIsUsable(state: state),
-                  let supplementalDictionaryURL = self.supplementalDictionaryURL else {
+        if query.hasPrefix(Self.supplementalQueryPrefix) {
+            guard let target = self.usableSupplementalTarget(of: query, state: state) else {
                 return nil
             }
             if self.importedLoudses.contains(query) {
                 return self.loudses[query]
             }
-            let identifier = DictionaryBuilder.escapedIdentifier(supplementalIdentifier)
+            let identifier = DictionaryBuilder.escapedIdentifier(target.identifier)
             self.importedLoudses.insert(query)
-            if let louds = LOUDS.load(identifier, dictionaryURL: supplementalDictionaryURL) {
+            if let louds = LOUDS.load(identifier, dictionaryURL: target.directoryURL) {
                 self.loudses[query] = louds
                 return louds
             } else {
@@ -386,7 +491,9 @@ public final class DicdataStore {
             )
             generator.register(typoCorrectionGenerator)
         }
-        let useSupplemental = self.supplementalDictionaryIsUsable(state: state)
+        let usableSupplementalSourceIDs = self.supplementalSources.filter {
+            self.supplementalSourceIsUsable($0, state: state)
+        }.map(\.id)
         var targetLOUDS: [String: LOUDS.MovingTowardPrefixSearchHelper] = [:]
         var stringToInfo: [([Character], (endIndex: Lattice.LatticeIndex, penalty: PValue))] = []
         // 動的辞書（一時学習データ、動的ユーザ辞書）から取り出されたデータ
@@ -401,8 +508,8 @@ public final class DicdataStore {
             if useMemory {
                 keys.append("memory")
             }
-            if useSupplemental {
-                keys.append(Self.supplementalQuery(String(firstCharacter)))
+            for sourceID in usableSupplementalSourceIDs {
+                keys.append(Self.supplementalQuery(String(firstCharacter), sourceID: sourceID))
             }
             var updated = false
             var availableMaxIndex = 0
@@ -512,20 +619,19 @@ public final class DicdataStore {
         // Group indices by shard
         let dict = [Int: [Int]].init(grouping: indices, by: { $0 >> DictionaryBuilder.shardShift })
         var data: [DicdataElement] = []
-        if let supplementalIdentifier = Self.supplementalIdentifier(from: identifier) {
-            guard self.supplementalDictionaryIsUsable(state: state),
-                  let supplementalDictionaryURL = self.supplementalDictionaryURL else {
+        if identifier.hasPrefix(Self.supplementalQueryPrefix) {
+            guard let target = self.usableSupplementalTarget(of: identifier, state: state) else {
                 return []
             }
-            let escaped = DictionaryBuilder.escapedIdentifier(supplementalIdentifier)
+            let escaped = DictionaryBuilder.escapedIdentifier(target.identifier)
             for (key, value) in dict {
-                // キャッシュキーはシステム辞書と衝突させない。同じ先頭文字でもノードindexの意味が異なる。
                 let fileID = "\(escaped)\(key)"
+                // キャッシュキーはシステム辞書・他の補助辞書と衝突させない。同じ先頭文字でも辞書ごとにノードindexの意味が異なる。
                 data.append(contentsOf: LOUDS.getDataForLoudstxt3(
                     fileID,
                     indices: value.map { $0 & DictionaryBuilder.localMask },
-                    cache: self.loudstxts[Self.supplementalQuery(fileID)],
-                    dictionaryURL: supplementalDictionaryURL
+                    cache: self.loudstxts[Self.supplementalQuery(fileID, sourceID: target.sourceID)],
+                    dictionaryURL: target.directoryURL
                 ))
             }
             return data
@@ -781,8 +887,8 @@ public final class DicdataStore {
             result.append(contentsOf: self.getDicdataFromLoudstxt3(identifier: "memory", indices: Set(consume memoryDictIndices), state: state))
             result.append(contentsOf: state.learningMemoryManager.temporaryPrefixMatch(charIDs: charIDs))
         }
-        if self.supplementalDictionaryIsUsable(state: state) {
-            let supplementalQuery = Self.supplementalQuery(first)
+        for source in self.supplementalSources where self.supplementalSourceIsUsable(source, state: state) {
+            let supplementalQuery = Self.supplementalQuery(first, sourceID: source.id)
             var supplementalIndices = self.startingFromPrefixSearch(query: supplementalQuery, charIDs: charIDs, depth: depth, maxCount: maxCount, state: state)
             if includeExactMatch, supplementalIndices.count < maxCount {
                 supplementalIndices.append(contentsOf: self.perfectMatchingSearch(query: supplementalQuery, charIDs: charIDs, state: state))

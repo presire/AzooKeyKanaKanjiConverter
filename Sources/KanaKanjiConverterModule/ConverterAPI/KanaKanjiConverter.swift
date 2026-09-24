@@ -48,6 +48,18 @@ public final class KanaKanjiConverter {
         )
         self.init(dicdataStore: dicdataStore)
     }
+    public convenience init(
+        dictionaryURL: URL,
+        supplementalDictionaries: [SupplementalDictionarySource],
+        preloadDictionary: Bool = false
+    ) throws {
+        let dicdataStore = try DicdataStore(
+            dictionaryURL: dictionaryURL,
+            supplementalDictionaries: supplementalDictionaries,
+            preloadDictionary: preloadDictionary
+        )
+        self.init(dicdataStore: dicdataStore)
+    }
     static func withoutDictionary() -> KanaKanjiConverter {
         KanaKanjiConverter(dictionaryURL: URL(fileURLWithPath: "/dev/null"), preloadDictionary: false)
     }
@@ -440,13 +452,25 @@ public final class KanaKanjiConverter {
         self.dicdataStoreState.updateLearningConfig(newConfig)
     }
 
-    /// 補助辞書が利用可能かどうか。ディレクトリ欠落や`charID.chid`不一致で無効化された場合は`false`。
+    /// 先頭の補助辞書が利用可能かどうか。ディレクトリ欠落や`charID.chid`不一致で無効化された場合は`false`。
     public var isSupplementalDictionaryAvailable: Bool {
         self.converter.dicdataStore.hasSupplementalDictionary
     }
 
+    /// 先頭の補助辞書を有効/無効にする。
     public func setSupplementalDictionaryEnabled(_ enabled: Bool) {
         self.dicdataStoreState.updateSupplementalDictionaryEnabled(enabled)
+    }
+
+    /// 指定IDの補助辞書が登録済みかつ検証済みかどうか。実行時の有効/無効には依存しない。
+    public func isSupplementalDictionaryAvailable(for id: String) -> Bool {
+        self.converter.dicdataStore.isSupplementalDictionaryAvailable(for: id)
+    }
+
+    /// 指定IDの補助辞書を有効/無効にする。未登録のIDでは何もせず`false`を返す。
+    @discardableResult
+    public func setSupplementalDictionaryEnabled(_ enabled: Bool, for id: String) -> Bool {
+        self.dicdataStoreState.updateSupplementalDictionaryEnabled(enabled, for: id)
     }
 
     /// 確定操作後、内部状態のキャッシュを変更する関数。
