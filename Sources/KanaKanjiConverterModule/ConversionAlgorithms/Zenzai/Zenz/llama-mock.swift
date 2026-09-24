@@ -39,6 +39,7 @@ package struct llama_model_params {
 package func llama_model_default_params() -> llama_model_params { unimplemented() }
 
 package func llama_model_get_vocab(_: llama_model) -> llama_vocab? { unimplemented() }
+package func llama_model_meta_val_str(_: llama_model, _: UnsafePointer<CChar>, _: UnsafeMutablePointer<CChar>, _: Int) -> Int32 { unimplemented() }
 
 package func llama_model_load_from_file(_: String, _: llama_model_params) -> llama_model? { unimplemented() }
 
