@@ -617,4 +617,98 @@ final class SupplementalDictionaryTests: XCTestCase {
 
         XCTAssertThrowsError(try KanaKanjiConverter(dictionaryURL: self.dictionaryMockURL, supplementalDictionaries: []))
     }
+
+    // MARK: - トグル変更時のキャッシュ無効化
+
+    private func conversionOptions() -> ConvertRequestOptions {
+        ConvertRequestOptions(
+            N_best: 5,
+            requireJapanesePrediction: .autoMix,
+            requireEnglishPrediction: .disabled,
+            keyboardLanguage: .ja_JP,
+            learningType: .nothing,
+            maxMemoryCount: 0,
+            memoryDirectoryURL: URL(fileURLWithPath: ""),
+            sharedContainerURL: URL(fileURLWithPath: ""),
+            textReplacer: .empty,
+            specialCandidateProviders: [],
+            metadata: nil
+        )
+    }
+
+    func testZenzaiMemoizationCacheIsPurgedOnlyWhenASourceFlagActuallyChanges() throws {
+        let converter = try KanaKanjiConverter(
+            dictionaryURL: self.dictionaryMockURL,
+            supplementalDictionaries: [
+                SupplementalDictionarySource(id: "address", directoryURL: try self.makeAddressDictionary()),
+                SupplementalDictionarySource(id: "engineering", directoryURL: try self.makeEngineeringDictionary())
+            ]
+        )
+        func seed() {
+            converter.zenzaiMemoizationCache.cacheEvaluationPromptTokens([1, 2, 3], for: "probe")
+        }
+        func isCached() -> Bool {
+            converter.zenzaiMemoizationCache.cachedEvaluationPromptTokens(for: "probe") != nil
+        }
+
+        seed()
+        converter.setSupplementalDictionaryEnabled(true, for: "address")
+        XCTAssertTrue(isCached(), "re-enabling an already enabled source must keep the cache")
+
+        converter.setSupplementalDictionaryEnabled(false, for: "address")
+        XCTAssertFalse(isCached())
+
+        seed()
+        converter.setSupplementalDictionaryEnabled(false, for: "address")
+        XCTAssertTrue(isCached(), "re-applying the same value must keep the cache")
+        converter.setSupplementalDictionaryEnabled(false, for: "unknown")
+        XCTAssertTrue(isCached())
+
+        converter.setSupplementalDictionaryEnabled(false, for: "engineering")
+        XCTAssertFalse(isCached())
+
+        seed()
+        converter.setSupplementalDictionaryEnabled(false)
+        XCTAssertTrue(isCached(), "the legacy toggle addresses the first source, which is already off")
+        converter.setSupplementalDictionaryEnabled(true)
+        XCTAssertFalse(isCached())
+    }
+
+    func testToggleIsNotMaskedByTheInFlightLatticeOfAnySession() throws {
+        let converter = try KanaKanjiConverter(
+            dictionaryURL: self.dictionaryMockURL,
+            supplementalDictionaries: [
+                SupplementalDictionarySource(
+                    id: "address",
+                    directoryURL: try self.makeSupplementalDictionary(entries: self.addressEntries())
+                )
+            ]
+        )
+        let otherSession = converter.createSession()
+        var composingText = ComposingText()
+        composingText.insertAtCursorPosition("ひとつや", inputStyle: .direct)
+        func offersHitotsuya() throws -> (default: Bool, other: Bool) {
+            let inDefault = converter.requestCandidates(composingText, options: self.conversionOptions())
+                .mainResults.contains { $0.text == "一ツ家" }
+            let inOther = try converter.withSession(otherSession) {
+                converter.requestCandidates(composingText, options: self.conversionOptions())
+                    .mainResults.contains { $0.text == "一ツ家" }
+            }
+            return (inDefault, inOther)
+        }
+
+        var offered = try offersHitotsuya()
+        XCTAssertTrue(offered.default)
+        XCTAssertTrue(offered.other)
+
+        converter.setSupplementalDictionaryEnabled(false, for: "address")
+        offered = try offersHitotsuya()
+        XCTAssertFalse(offered.default, "the default session replayed a lattice built before the toggle")
+        XCTAssertFalse(offered.other, "another session replayed a lattice built before the toggle")
+
+        converter.setSupplementalDictionaryEnabled(true, for: "address")
+        offered = try offersHitotsuya()
+        XCTAssertTrue(offered.default)
+        XCTAssertTrue(offered.other)
+    }
 }

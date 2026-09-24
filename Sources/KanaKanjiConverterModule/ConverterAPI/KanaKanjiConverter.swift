@@ -459,7 +459,10 @@ public final class KanaKanjiConverter {
 
     /// 先頭の補助辞書を有効/無効にする。
     public func setSupplementalDictionaryEnabled(_ enabled: Bool) {
-        self.dicdataStoreState.updateSupplementalDictionaryEnabled(enabled)
+        guard let firstID = self.dicdataStoreState.firstSupplementalSourceID else {
+            return
+        }
+        self.setSupplementalDictionaryEnabled(enabled, for: firstID)
     }
 
     /// 指定IDの補助辞書が登録済みかつ検証済みかどうか。実行時の有効/無効には依存しない。
@@ -470,7 +473,29 @@ public final class KanaKanjiConverter {
     /// 指定IDの補助辞書を有効/無効にする。未登録のIDでは何もせず`false`を返す。
     @discardableResult
     public func setSupplementalDictionaryEnabled(_ enabled: Bool, for id: String) -> Bool {
-        self.dicdataStoreState.updateSupplementalDictionaryEnabled(enabled, for: id)
+        let wasEnabled = self.dicdataStoreState.isSupplementalDictionaryEnabled(id)
+        guard self.dicdataStoreState.updateSupplementalDictionaryEnabled(enabled, for: id) else {
+            return false
+        }
+        if wasEnabled != enabled {
+            self.invalidateSupplementalDictionaryDependentCaches()
+        }
+        return true
+    }
+
+    /// 補助辞書の有効フラグが変わった後、変更前の辞書から作った変換結果を再利用しないよう破棄する。
+    /// 利用者が明示的に受け入れた予測候補と、学習用の直前の確定語だけは保持する。
+    private func invalidateSupplementalDictionaryDependentCaches() {
+        self.purgeZenzaiMemoizationCache()
+        self.sessions = self.sessions.mapValues { state in
+            var next = state
+            next.previousInputData = nil
+            next.lattice = .init()
+            next.completedData = nil
+            next.zenzaiCache = next.zenzaiCache?.keepingOnlyAcceptedPrefix()
+            next.stablePredictionCandidateCache = nil
+            return next
+        }
     }
 
     /// 確定操作後、内部状態のキャッシュを変更する関数。

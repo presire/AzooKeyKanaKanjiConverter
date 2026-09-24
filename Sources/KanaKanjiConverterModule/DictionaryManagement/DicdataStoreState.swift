@@ -32,6 +32,10 @@ package final class DicdataStoreState {
     private var supplementalDictionaryEnabledByID: [String: Bool] = [:]
     private var staticConversionCacheEligibility: Bool?
 
+    var firstSupplementalSourceID: String? {
+        self.supplementalSourceIDs.first
+    }
+
     func isSupplementalDictionaryEnabled(_ id: String) -> Bool {
         self.supplementalDictionaryEnabledByID[id] ?? true
     }

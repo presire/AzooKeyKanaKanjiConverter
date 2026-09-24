@@ -81,6 +81,18 @@ extension Kana2Kanji {
             )
         }
 
+        func keepingOnlyAcceptedPrefix() -> ZenzaiCache {
+            ZenzaiCache(
+                self.inputData,
+                constraint: PrefixConstraint([]),
+                satisfyingCandidate: nil,
+                evaluatedSatisfyingCandidate: nil,
+                prefixCandidate: self.prefixCandidate,
+                cachedLattice: nil,
+                cachedLatticeInputData: nil
+            )
+        }
+
         func getNewConstraint(for newInputData: ComposingText) -> PrefixConstraint {
             self.fixingPrefix(self.getReplaceableConstraint(for: newInputData), for: newInputData)
         }
