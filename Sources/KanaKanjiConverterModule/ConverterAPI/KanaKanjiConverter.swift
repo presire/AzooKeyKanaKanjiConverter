@@ -11,6 +11,14 @@ import EfficientNGram
 public import Foundation
 import SwiftUtils
 
+// [hazkey-community patch] Zenzai要求中でカーソル途中のときだけ変換対象をカーソルまでの読みに切り詰める純関数。
+// Zenzaiを使わないセッションでは全文がそのまま返るため、上流の挙動は変わらない。
+extension Kana2Kanji {
+    static func hazkeyConversionTarget(for inputData: ComposingText, zenzaiRequested: Bool) -> ComposingText {
+        (zenzaiRequested && !inputData.isAtEndIndex) ? inputData.prefixToCursorPosition() : inputData
+    }
+}
+
 /// かな漢字変換の管理を受け持つクラス
 public final class KanaKanjiConverter {
     /// 1つのConverterを複数の入力セッションで共有するための識別子。
@@ -23,8 +31,12 @@ public final class KanaKanjiConverter {
     }
 
     private let converter: Kana2Kanji
-    private struct ConversionSessionState {
+    // @testableなテストから latticeIsFromZenzai を操作するために internal とする。
+    struct ConversionSessionState {
         var previousInputData: ComposingText?
+        // [hazkey-community patch] 現在のラティスがall_zenzaiで作られたものかどうか。
+        // 非Zenzai経路で差分更新に再利用すると候補が失われるため、作り直しの判定に使う。
+        var latticeIsFromZenzai = false
         var lattice: Lattice = .init()
         var completedData: Candidate?
         var zenzaiCache: Kana2Kanji.ZenzaiCache?
@@ -93,7 +105,8 @@ public final class KanaKanjiConverter {
         self.sessions[self.activeSessionID] ?? .init()
     }
 
-    private func updateCurrentSessionState(_ update: (inout ConversionSessionState) -> Void) {
+    // @testableなテストからセッション状態を操作するために internal とする。
+    func updateCurrentSessionState(_ update: (inout ConversionSessionState) -> Void) {
         var state = self.currentSessionState
         update(&state)
         self.sessions[self.activeSessionID] = state
@@ -1324,10 +1337,12 @@ public final class KanaKanjiConverter {
     /// - Parameters:
     ///   - inputData: 変換対象のInputData。
     ///   - N_best: 計算途中で保存する候補数。実際に得られる候補数とは異なる。
+    ///   - conversionTarget: ラティス構築とセッション状態の保存に使う変換対象。
     /// - Returns:
     ///   結果のラティスノードと、計算済みノードの全体
-    private func convertToLattice(_ inputData: ComposingText, N_best: Int, zenzaiMode: ConvertRequestOptions.ZenzaiMode, needTypoCorrection: Bool) -> (result: LatticeNode, lattice: Lattice)? {
-        if inputData.convertTarget.isEmpty {
+    private func convertToLattice(_ inputData: ComposingText, N_best: Int, zenzaiMode: ConvertRequestOptions.ZenzaiMode, needTypoCorrection: Bool, conversionTarget: ComposingText) -> (result: LatticeNode, lattice: Lattice)? {
+        // [hazkey-community patch] カーソル位置0では変換対象が空になるため、全文の入力があっても何もしない
+        if conversionTarget.convertTarget.isEmpty {
             return nil
         }
 
@@ -1345,43 +1360,68 @@ public final class KanaKanjiConverter {
                 dicdataStoreState: self.dicdataStoreState
             )
             self.updateCurrentSessionState {
-                $0.previousInputData = inputData
+                // [hazkey-community patch] all_zenzaiはカーソルまでの読みのラティスを作るため、
+                // セッションにはカーソルまでの読みを保存し、Zenzai由来の印を残す
+                $0.previousInputData = conversionTarget
+                $0.latticeIsFromZenzai = true
                 $0.zenzaiCache = cache
             }
             return (result, nodes)
         }
 
-        guard let previousInputData = self.currentSessionState.previousInputData else {
-            debug("\(#function): 新規計算用の関数を呼びますA")
+        // [hazkey-community patch] Zenzaiが作ったラティスはキャッシュ命中時に先頭の列だけ、
+        // 通常時もbest-1の制約付き探索の結果であり、差分更新に使うと候補が失われるため作り直す
+        if self.currentSessionState.latticeIsFromZenzai {
+            debug("\(#function): Zenzai由来のラティスを破棄して新規計算用の関数を呼びます")
             let result = converter.kana2lattice_all(
-                inputData,
+                conversionTarget,
                 N_best: N_best,
                 needTypoCorrection: needTypoCorrection,
                 dicdataStoreState: self.dicdataStoreState
             )
             self.updateCurrentSessionState {
-                $0.previousInputData = inputData
+                $0.previousInputData = conversionTarget
+                $0.latticeIsFromZenzai = false
+                // [hazkey-community patch] 破棄したZenzai由来ラティスに属する確定状態は再利用しない。
+                $0.completedData = nil
             }
             return result
         }
 
-        debug("\(#function): before \(previousInputData) after \(inputData)")
+        guard let previousInputData = self.currentSessionState.previousInputData else {
+            debug("\(#function): 新規計算用の関数を呼びますA")
+            let result = converter.kana2lattice_all(
+                conversionTarget,
+                N_best: N_best,
+                needTypoCorrection: needTypoCorrection,
+                dicdataStoreState: self.dicdataStoreState
+            )
+            self.updateCurrentSessionState {
+                $0.previousInputData = conversionTarget
+                $0.latticeIsFromZenzai = false
+            }
+            return result
+        }
+
+        debug("\(#function): before \(previousInputData) after \(conversionTarget)")
 
         // 完全一致の場合
-        if previousInputData == inputData {
+        if previousInputData == conversionTarget {
             let result = converter.kana2lattice_no_change(N_best: N_best, previousResult: (inputData: previousInputData, lattice: self.currentSessionState.lattice))
             self.updateCurrentSessionState {
-                $0.previousInputData = inputData
+                $0.previousInputData = conversionTarget
+                $0.latticeIsFromZenzai = false
             }
             return result
         }
 
         // 文節確定の後の場合
-        if let completedData = self.currentSessionState.completedData, previousInputData.inputHasSuffix(inputOf: inputData) {
+        if let completedData = self.currentSessionState.completedData, previousInputData.inputHasSuffix(inputOf: conversionTarget) {
             debug("\(#function): 文節確定用の関数を呼びます、確定された文節は\(completedData)")
-            let result = converter.kana2lattice_afterComplete(inputData, completedData: completedData, N_best: N_best, previousResult: (inputData: previousInputData, lattice: self.currentSessionState.lattice), needTypoCorrection: needTypoCorrection)
+            let result = converter.kana2lattice_afterComplete(conversionTarget, completedData: completedData, N_best: N_best, previousResult: (inputData: previousInputData, lattice: self.currentSessionState.lattice), needTypoCorrection: needTypoCorrection)
             self.updateCurrentSessionState {
-                $0.previousInputData = inputData
+                $0.previousInputData = conversionTarget
+                $0.latticeIsFromZenzai = false
                 $0.completedData = nil
             }
             return result
@@ -1390,11 +1430,11 @@ public final class KanaKanjiConverter {
         // TODO: 元々はsuffixになっていないが、文節確定の後であるケースで、確定された文節を考慮できるようにする
         // へんかん|する → 変換 する|　のようなパターンで、previousInputData: へんかん, inputData: する, となることがある
 
-        let diff = inputData.differenceSuffix(to: previousInputData)
+        let diff = conversionTarget.differenceSuffix(to: previousInputData)
 
         debug("\(#function): 最後尾文字置換用の関数を呼びます、差分は\(diff)")
         let result = converter.kana2lattice_changed(
-            inputData,
+            conversionTarget,
             N_best: N_best,
             counts: diff,
             previousResult: (inputData: previousInputData, lattice: self.currentSessionState.lattice),
@@ -1402,7 +1442,8 @@ public final class KanaKanjiConverter {
             dicdataStoreState: self.dicdataStoreState
         )
         self.updateCurrentSessionState {
-            $0.previousInputData = inputData
+            $0.previousInputData = conversionTarget
+            $0.latticeIsFromZenzai = false
         }
 
         return result
@@ -1439,11 +1480,13 @@ public final class KanaKanjiConverter {
         }
         self.dicdataStoreState.updateIfRequired(options: options)
         let needTypoCorrection = self.isClassicTypoCorrectionEnabled(options)
+        // [hazkey-community patch] Zenzai要求中でカーソル途中のときは、後処理とセッション状態をカーソルまでの読みで扱う
+        let conversionTarget = Kana2Kanji.hazkeyConversionTarget(for: inputData, zenzaiRequested: options.zenzaiMode.enabled)
 
-        guard let result = self.convertToLattice(inputData, N_best: options.N_best, zenzaiMode: options.zenzaiMode, needTypoCorrection: needTypoCorrection) else {
+        guard let result = self.convertToLattice(inputData, N_best: options.N_best, zenzaiMode: options.zenzaiMode, needTypoCorrection: needTypoCorrection, conversionTarget: conversionTarget) else {
             return ConversionResult(mainResults: [], predictionResults: [], englishPredictionResults: [], firstClauseResults: [])
         }
-        return self.processResult(inputData: inputData, result: result, options: options)
+        return self.processResult(inputData: conversionTarget, result: result, options: options)
     }
 
     private func isClassicTypoCorrectionEnabled(_ options: ConvertRequestOptions) -> Bool {

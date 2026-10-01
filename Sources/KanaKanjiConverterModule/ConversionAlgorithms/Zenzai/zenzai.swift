@@ -228,10 +228,8 @@ extension Kana2Kanji {
             if !requestRichCandidates,
                personalizationMode == nil,
                dicdataStoreState.canShareStaticConversionResults() {
-                ZenzResolvedConversionCacheKey(
-                    input: latticeInputData.input,
-                    convertTarget: latticeInputData.convertTarget,
-                    convertTargetCursorPosition: zenzInputCursorPosition,
+                Self.resolvedConversionCacheKey(
+                    for: inputData,
                     keyboardLanguage: dicdataStoreState.keyboardLanguage,
                     versionDependentConfig: versionDependentConfig,
                     prefixConstraint: constraint,
@@ -572,6 +570,29 @@ extension Kana2Kanji {
 
     static func zenzaiInputCursorPosition(for inputData: ComposingText) -> Int? {
         inputData.isAtEndIndex ? nil : inputData.convertTargetCursorPosition
+    }
+
+    // [hazkey-community patch] 解決済み変換キャッシュのキーを組み立てる。
+    // ラティス入力 (カーソルまで) だけをキーにすると、カーソルより前の読みが同じで
+    // 右側の読みが違う入力が同じ結果を共有してしまうため、評価に使った全文の読みも含める。
+    static func resolvedConversionCacheKey(
+        for inputData: ComposingText,
+        keyboardLanguage: KeyboardLanguage,
+        versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
+        prefixConstraint: PrefixConstraint,
+        inferenceLimit: Int
+    ) -> ZenzResolvedConversionCacheKey {
+        let latticeInputData = Self.zenzaiLatticeInputData(for: inputData)
+        return ZenzResolvedConversionCacheKey(
+            input: latticeInputData.input,
+            convertTarget: latticeInputData.convertTarget,
+            convertTargetCursorPosition: Self.zenzaiInputCursorPosition(for: inputData),
+            keyboardLanguage: keyboardLanguage,
+            versionDependentConfig: versionDependentConfig,
+            prefixConstraint: prefixConstraint,
+            inferenceLimit: inferenceLimit,
+            evaluationConvertTarget: inputData.convertTarget
+        )
     }
 
     private func review(

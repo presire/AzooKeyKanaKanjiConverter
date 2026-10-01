@@ -291,7 +291,8 @@ final class ZenzPromptBuilderTests: XCTestCase {
             keyboardLanguage: .ja_JP,
             versionDependentConfig: .v3(.init()),
             prefixConstraint: .init([]),
-            inferenceLimit: 1
+            inferenceLimit: 1,
+            evaluationConvertTarget: "こうほ"
         )
         let latticeHead = ZenzResolvedLatticeHead(nodes: [])
         let draft = ZenzDraftConversion(resultPrevs: [], resultLatticeHead: latticeHead)

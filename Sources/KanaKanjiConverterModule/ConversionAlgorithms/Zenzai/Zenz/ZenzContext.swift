@@ -351,6 +351,9 @@ struct ZenzResolvedConversionCacheKey: Equatable, Hashable {
     var versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode
     var prefixConstraint: Kana2Kanji.PrefixConstraint
     var inferenceLimit: Int
+    // [hazkey-community patch] 評価に使った全文の読み。カーソルより前の読みが同じでも
+    // 右側の読みが違う入力で変換結果を共有しないため、キーの一部にする。
+    var evaluationConvertTarget: String
 }
 
 struct ZenzDraftConversionCacheKey: Equatable, Hashable {
