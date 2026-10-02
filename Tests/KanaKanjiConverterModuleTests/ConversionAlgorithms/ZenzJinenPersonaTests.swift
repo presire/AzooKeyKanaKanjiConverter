@@ -158,7 +158,7 @@ final class ZenzJinenPersonaTests: XCTestCase {
             self.prompt(for: self.v3(profile: "　ＡＢＣ　エンジニア ")),
             "ABC エンジニア" + S + "カンジ"
         )
-        // ㍿ (U+32FF) becomes 4 chars under NFKC; 25 in a row cap at 25 NFKC chars.
+        // ㍿ (U+337F) becomes 4 chars under NFKC; 25 in a row cap at 25 NFKC chars.
         let many = String(repeating: "㍿", count: 25)
         let expectedP = String((many.precomposedStringWithCompatibilityMapping).suffix(25))
         XCTAssertEqual(expectedP.count, 25)
