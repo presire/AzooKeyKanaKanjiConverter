@@ -1124,6 +1124,13 @@ public final class DicdataStore {
         state.dynamicUserDictionary.filter {$0.ruby.hasPrefix(ruby)}
     }
 
+    /// 動的ユーザ辞書から、rubiesのいずれかに先頭一致する語を返す。複数のrubyに一致する語も1回だけ返す。
+    func getPrefixMatchDynamicUserDict(anyOf rubies: [some StringProtocol], state: DicdataStoreState) -> [DicdataElement] {
+        state.dynamicUserDictionary.filter { data in
+            rubies.contains { data.ruby.hasPrefix($0) }
+        }
+    }
+
     private func loadCCLine(_ former: Int) {
         let url = self.dictionaryURL.appending(path: "cb/\(former).binary", directoryHint: .notDirectory)
         let values = self.loadCCBinary(url: url)
