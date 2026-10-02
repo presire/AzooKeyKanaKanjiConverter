@@ -267,6 +267,17 @@ struct ZenzCandidateEvaluator {
         }
 
         var altTokens = FixedSizeHeap<AlternativeHighProbToken>(size: requestRichCandidates ? 5 : 0)
+        // [hazkey-community patch] 候補側のトークンだけを復号する。
+        // jinen の U+EE00〜EE02 は CONTROL トークンで、llama_token_to_piece(special: false) が空文字列に復号するため、
+        // プロンプトを含めて復号し dropFirst(normalizedPrompt) で落とす旧方式は生成の先頭を欠落させた。
+        // zenz では復号結果が normalizedPrompt とバイト同一なので結果は変わらない。
+        // 同じトークンスライスの先例は personalization 分岐 (tokens[..<i].dropFirst(promptTokens.count)) にある。
+        func decodeCandidatePieces(upTo i: Int) -> [CChar] {
+            tokens[promptTokens.count ..< i].reduce(into: []) {
+                $0.append(contentsOf: context.tokenToPiece(token: $1))
+            }
+        }
+
         func evaluateTokenRange(
             _ range: Range<Int>,
             logits: UnsafeMutablePointer<Float>,
@@ -358,12 +369,9 @@ struct ZenzCandidateEvaluator {
 
                 if maxItem.token != tokenID {
                     if maxItem.token == context.eosToken {
-                        let cchars = tokens[..<i].reduce(into: []) {
-                            $0.append(contentsOf: context.tokenToPiece(token: $1))
-                        }
+                        let cchars = decodeCandidatePieces(upTo: i)
                         let data = Data(cchars.map { UInt8(bitPattern: $0) })
-                        let string = String(data: data, encoding: .utf8) ?? ""
-                        let wholeResult = String(string.dropFirst(normalizedPrompt.count))
+                        let wholeResult = String(data: data, encoding: .utf8) ?? ""
                         return finish(.wholeResult(wholeResult))
                     } else {
                         let candidateTokenIndex = i - promptTokens.count
@@ -374,21 +382,18 @@ struct ZenzCandidateEvaluator {
                         let preferLearnedToken = learnedPriority > 0
                             && logits[startIndex + Int(tokenID)] + learnedPriority > maxItem.logit
                         if !preferLearnedToken {
-                            let cchars = tokens[..<i].reduce(into: []) {
-                                $0.append(contentsOf: context.tokenToPiece(token: $1))
-                            } + context.tokenToPiece(token: maxItem.token)
+                            let cchars = decodeCandidatePieces(upTo: i)
+                                + context.tokenToPiece(token: maxItem.token)
                             return finish(
                                 .fixRequired(
-                                    prefixConstraint: cchars.dropFirst(normalizedPrompt.utf8.count).map(UInt8.init)
+                                    prefixConstraint: cchars.map(UInt8.init)
                                 )
                             )
                         }
                     }
                 } else if requestRichCandidates {
                     tokenHeap.removeMax()
-                    let prefix = tokens[..<i].reduce(into: []) {
-                        $0.append(contentsOf: context.tokenToPiece(token: $1))
-                    }.dropFirst(normalizedPrompt.utf8.count)
+                    let prefix = decodeCandidatePieces(upTo: i)
 
                     for item in tokenHeap.unordered {
                         altTokens.insertIfPossible(
