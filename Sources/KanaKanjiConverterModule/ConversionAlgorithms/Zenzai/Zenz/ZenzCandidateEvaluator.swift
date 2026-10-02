@@ -148,9 +148,10 @@ struct ZenzCandidateEvaluator {
             }
         }
         // [hazkey-community patch] jinen では profile/topic/style/preference・右文脈・
-        // alignment separator を落とし、zenz v3 と同一のタグ構造 (EE02/EE00/EE01) にする。
+        // alignment separator を落とし、profile は左文脈の先頭へ畳み込む。
+        // zenz v3 と同一のタグ構造 (EE02/EE00/EE01) にする。
         let effectiveConfig = context.isJinenModel
-            ? Self.jinenAdjustedMode(versionDependentConfig)
+            ? Self.jinenEvaluationMode(versionDependentConfig)
             : versionDependentConfig
         let prompt = ZenzPromptBuilder.candidateEvaluationPrompt(
             input: input,
@@ -452,6 +453,61 @@ struct ZenzCandidateEvaluator {
             mode.preference = nil
             mode.rightSideContext = nil
             mode.enableAlignmentSeparator = false
+            return .v3(mode)
+        }
+    }
+
+    /// [hazkey-community patch] jinen 用の区切り文字。karukan (jinen 作者の IME、
+    /// karukan-im/core/src/core/engine/model.rs) はペルソナと文脈を半角空白でつなぐが、
+    /// hazkey が使う llama.cpp 内蔵トークナイザでは NFKC 後の U+0020 がバイトフォールバック
+    /// (230,154,133) になり、学習時の HF 符号化 (260) と食い違うことを todo 1 の判定ゲートで
+    /// 実測した (S=" " は 0/12 一致、S="。" は 12/12 一致)。そのため既定は句点とする。
+    static let jinenPersonaSeparator = "。"
+
+    /// [hazkey-community patch] jinen (Qwen3) の候補評価用モード。`jinenAdjustedMode` の結果に、
+    /// 元の v3 `profile` を左文脈の先頭へ「P + S + C」として畳み込む。P は NFKC → trim →
+    /// 末尾 25 文字 → trim (karukan の persona 正規化と同じ順序に切り口の trim を加えたもの)、
+    /// S は `jinenPersonaSeparator` (P が既に文末記号 。 . ! ? で終わるときは空にする)、
+    /// C は従来の切り詰め (`mode.maxLeftSideContextLength ?? 40`、40 の出所は
+    /// `ZenzPromptBuilder.trimmedModeContext` の既定値) を先に適用した左文脈。
+    /// 畳み込み後の全体長を `maxLeftSideContextLength` に固定するため、ペルソナは別枠で
+    /// 残り、後段の `suffix` で切られない。profile が空なら調整済みモードをそのまま返す。
+    static func jinenEvaluationMode(
+        _ config: ConvertRequestOptions.ZenzaiVersionDependentMode
+    ) -> ConvertRequestOptions.ZenzaiVersionDependentMode {
+        switch config {
+        case .v2:
+            return config
+        case .v3(let original):
+            let adjusted = Self.jinenAdjustedMode(config)
+            guard case .v3(var mode) = adjusted else {
+                return adjusted
+            }
+            guard let rawProfile = original.profile else {
+                return adjusted
+            }
+            let trimmed = rawProfile.precomposedStringWithCompatibilityMapping
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                return adjusted
+            }
+            let persona = String(trimmed.suffix(25))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !persona.isEmpty else {
+                return adjusted
+            }
+            let separator: String
+            if Self.jinenPersonaSeparator == "。",
+               persona.hasSuffix("。") || persona.hasSuffix(".") || persona.hasSuffix("!")
+                || persona.hasSuffix("?") {
+                separator = ""
+            } else {
+                separator = Self.jinenPersonaSeparator
+            }
+            let context = String((mode.leftSideContext ?? "").suffix(mode.maxLeftSideContextLength ?? 40))
+            let combined = persona + separator + context
+            mode.leftSideContext = combined
+            mode.maxLeftSideContextLength = combined.count
             return .v3(mode)
         }
     }
