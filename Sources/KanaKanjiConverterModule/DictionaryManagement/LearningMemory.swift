@@ -116,6 +116,10 @@ struct LongTermLearningMemory {
                 buffer.loadUnaligned(fromByteOffset: 0, as: UInt32.self)
             }
             var offset = nodeCountSize
+            // 各ノードは少なくとも件数の1バイトを持つ。残りのバイト数を超えるノード数は壊れており、確保の前に棄却する
+            guard Int(nodeCount) <= data.count - offset else {
+                throw LearningMemoryEnumerationError.malformedMetadata
+            }
             var blocks: [MetadataBlock] = []
             blocks.reserveCapacity(Int(nodeCount))
 
@@ -455,52 +459,95 @@ struct LongTermLearningMemory {
         // 構造:
         // dataCount(UInt32), count, data*count, count, data*count, ...
         // MARK: 読み出しは、`metadataFile`が存在しなかった場合（学習が一切ない場合）に失敗する。
-        let ltMetadata = (try? Data(contentsOf: metadataFileURL(asTemporaryFile: false, directoryURL: directoryURL))) ?? Data([.zero, .zero, .zero, .zero])
-        var metadataOffset = 0
+        // 先頭4byteの件数すら読めないメタデータも、学習が一切ない場合と同じに扱う。
+        let storedMetadata = (try? Data(contentsOf: metadataFileURL(asTemporaryFile: false, directoryURL: directoryURL))) ?? Data()
+        let ltMetadata = storedMetadata.count >= 4 ? storedMetadata : Data([.zero, .zero, .zero, .zero])
+        var metadataOffset = ltMetadata.startIndex
         // 最初の4byteはentry countに対応する
-        let entryCount = ltMetadata[metadataOffset ..< metadataOffset + 4].toArray(of: UInt32.self)[0]
+        let declaredEntryCount = Int(ltMetadata[metadataOffset ..< metadataOffset + 4].toArray(of: UInt32.self)[0])
+        // 各ノードは少なくとも1byteを持つため、残りのバイト数を超える件数は壊れている。走査するシャードの数を抑えるために丸める。
+        let entryCount = min(declaredEntryCount, ltMetadata.count - 4)
         metadataOffset += 4
 
         debug("LongTermLearningMemory merge entryCount", entryCount, ltMetadata.count)
 
+        // 1ノード分のメタデータを読む。範囲外の場合はnilを返し、以降のメタデータとの対応は取れないものとする。
+        func readMetadataBlock() -> [MetadataElement]? {
+            guard metadataOffset < ltMetadata.endIndex else {
+                return nil
+            }
+            // 1byteで項目数
+            let itemCount = Int(ltMetadata[metadataOffset])
+            let byteCount = itemCount * MemoryLayout<MetadataElement>.size
+            guard byteCount <= ltMetadata.endIndex - (metadataOffset + 1) else {
+                return nil
+            }
+            metadataOffset += 1
+            let metadata = (0 ..< itemCount).map {
+                let range = metadataOffset + $0 * MemoryLayout<MetadataElement>.size ..< metadataOffset + ($0 + 1) * MemoryLayout<MetadataElement>.size
+                return ltMetadata[range].toArray(of: MetadataElement.self)[0]
+            }
+            metadataOffset += byteCount
+            return metadata
+        }
+
+        // loudstxt3の索引を読む。件数・索引が範囲外の場合はnilを返す。
+        func readShardIndices(_ loudstxtData: Data) -> [UInt32]? {
+            guard loudstxtData.count >= 2 else {
+                return nil
+            }
+            let count = Int(loudstxtData[loudstxtData.startIndex ..< loudstxtData.startIndex + 2].toArray(of: UInt16.self)[0])
+            guard 2 + 4 * count <= loudstxtData.count else {
+                return nil
+            }
+            return loudstxtData[loudstxtData.startIndex + 2 ..< loudstxtData.startIndex + 2 + 4 * count].toArray(of: UInt32.self)
+        }
+
         // それぞれのloudstxt3ファイルに対して処理を行う
-        for loudstxtIndex in 0 ..< Int(entryCount) / txtFileSplit + 1 {
-            let loudstxtData: Data
-            do {
-                loudstxtData = try Data(contentsOf: loudsTxt3FileURL("\(loudstxtIndex)", asTemporaryFile: false, directoryURL: directoryURL))
-            } catch {
-                debug("LongTermLearningMemory merge failed to read \(loudstxtIndex)", error)
+        // 読めない・壊れたシャードは飛ばし、そのシャードが持つはずのノード数だけメタデータを読み捨てて、後続のシャードとの対応を保つ。
+        // `update(trie:directoryURL:)`は各シャードへちょうど`txtFileSplit`ノードずつ (最後のシャードは残り全部) 書くため、件数がこれと異なるシャードも壊れている。
+        // 壊れたメタデータ以降は対応が取れないため、そこで長期記憶の読み込みを打ち切る。
+        shardLoop: for loudstxtIndex in 0 ..< entryCount / txtFileSplit + 1 {
+            let expectedNodeCount = max(0, min(txtFileSplit, declaredEntryCount - loudstxtIndex * txtFileSplit))
+            guard let loudstxtData = try? Data(contentsOf: loudsTxt3FileURL("\(loudstxtIndex)", asTemporaryFile: false, directoryURL: directoryURL)),
+                  let indices = readShardIndices(loudstxtData),
+                  indices.count == expectedNodeCount else {
+                debug("LongTermLearningMemory merge failed to read \(loudstxtIndex)")
+                for _ in 0 ..< expectedNodeCount {
+                    guard readMetadataBlock() != nil else {
+                        break shardLoop
+                    }
+                }
                 continue
             }
-            // loudstxt3の数
-            let count = Int(loudstxtData[0 ..< 2].toArray(of: UInt16.self)[0])
-            let indices = loudstxtData[2 ..< 2 + 4 * count].toArray(of: UInt32.self)
-            for i in 0 ..< count {
+            for i in indices.indices {
                 guard metadataOffset < ltMetadata.endIndex else {
                     break
                 }
                 // メタデータの読み取り
-                // 1byteで項目数
-                let itemCount = Int(ltMetadata[metadataOffset ..< metadataOffset + 1].toArray(of: UInt8.self)[0])
-                metadataOffset += 1
-                let metadata = (0 ..< itemCount).map {
-                    let range = metadataOffset + $0 * MemoryLayout<MetadataElement>.size ..< metadataOffset + ($0 + 1) * MemoryLayout<MetadataElement>.size
-                    return ltMetadata[range].toArray(of: MetadataElement.self)[0]
+                guard let metadata = readMetadataBlock() else {
+                    break shardLoop
                 }
-                metadataOffset += itemCount * MemoryLayout<MetadataElement>.size
 
                 // バイナリ内部でのindex
                 let startIndex = Int(indices[i])
                 let endIndex = i == (indices.endIndex - 1) ? loudstxtData.endIndex : Int(indices[i + 1])
+                guard loudstxtData.startIndex <= startIndex, startIndex <= endIndex, endIndex <= loudstxtData.endIndex else {
+                    debug("LongTermLearningMemory merge skipped a node with an out-of-range entry", loudstxtIndex, i)
+                    continue
+                }
                 let elements = LOUDS.parseBinary(binary: loudstxtData[startIndex ..< endIndex])
                 // 該当部分を取り出してメタデータに従ってフィルター、trieに追加
                 guard let ruby = elements.first?.ruby,
                       let chars = LearningManager.keyToChars(ruby, char2UInt8: char2UInt8) else {
                     continue
                 }
+                guard elements.count == metadata.count else {
+                    debug("LongTermLearningMemory merge skipped a node whose elements and metadata counts differ", elements.count, metadata.count)
+                    continue
+                }
                 var newDicdata: [DicdataElement] = []
                 var newMetadata: [MetadataElement] = []
-                assert(elements.count == metadata.count, "elements count and metadata count must be equal.")
                 for (dicdataElement, metadataElement) in zip(elements, metadata) {
                     // 忘却対象である場合は弾く（粗いチェック）
                     if forgetPolicy.matches(dicdataElement) {
@@ -560,6 +607,11 @@ struct LongTermLearningMemory {
     enum UpdateError: Error {
         /// `.pause`が存在するため更新を停止する場合
         case pauseFileExist
+        /// `.pause`を書き出した後に失敗した場合
+        ///
+        /// `.2`のファイルにはこの更新の内容が揃っており、次回の`merge`が元のファイルの位置へ復元する。
+        /// 呼び出し側は同じ一時記憶を再びマージしてはいけない (学習の回数が二重に加算される)。
+        case interruptedAfterPause(any Error)
     }
 
     /// ファイルを安全に書き出すため、以下の手順を取る
@@ -638,19 +690,27 @@ struct LongTermLearningMemory {
             )
         }
 
-        // MARK: `.pause`ファイルを書き出す
-        try Data().write(to: pauseFileURL(directoryURL: directoryURL))
+        do {
+            // MARK: `.pause`ファイルを書き出す
+            try Data().write(to: pauseFileURL(directoryURL: directoryURL))
 
-        // MARK: 各`.2`のファイルで元のファイルを上書きする
-        try overwriteTempFiles(
-            directoryURL: directoryURL,
-            loudsFileTemp: loudsFileTemp,
-            loudsCharsFileTemp: loudsCharsFileTemp,
-            metadataFileTemp: metadataFileTemp,
-            loudsTxt3FileCount: loudsTxt3FileCount,
-            // MARK: 成功の場合、`.pause`ファイルも削除する
-            removingRead2File: true
-        )
+            // MARK: 各`.2`のファイルで元のファイルを上書きする
+            try overwriteTempFiles(
+                directoryURL: directoryURL,
+                loudsFileTemp: loudsFileTemp,
+                loudsCharsFileTemp: loudsCharsFileTemp,
+                metadataFileTemp: metadataFileTemp,
+                loudsTxt3FileCount: loudsTxt3FileCount,
+                // MARK: 成功の場合、`.pause`ファイルも削除する
+                removingRead2File: true
+            )
+        } catch {
+            // 冒頭で`.pause`が無いことを確認しているため、ここで残っている`.pause`はこの更新が書き出したものである
+            if fileExist(pauseFileURL(directoryURL: directoryURL)) {
+                throw UpdateError.interruptedAfterPause(error)
+            }
+            throw error
+        }
     }
 
     /// - note: 上書きが全て成功するまで、一時ファイルは削除してはいけない。安全のため、`.pause`を除きそもそも一時ファイルを一切削除しないようにする。
@@ -1147,6 +1207,10 @@ final class LearningManager {
             try LongTermLearningMemory.merge(tempTrie: self.temporaryMemory, forgetTargets: data, directoryURL: memoryURL, maxMemoryCount: self.config.maxMemoryCount, char2UInt8: char2UInt8)
             // マージが済んだので、temporaryMemoryを空にする
             self.temporaryMemory = TemporalLearningMemoryTrie()
+        } catch LongTermLearningMemory.UpdateError.interruptedAfterPause(let error) {
+            // temporaryMemoryの内容は`.2`のファイルに含まれ、次回の`merge`で復元されるため、二重に学習しないよう空にする
+            self.temporaryMemory = TemporalLearningMemoryTrie()
+            debug("LearningManager resetLearning: Failed to save LongTermLearningMemory", error)
         } catch {
             // アップデートに失敗した場合、そのまま諦める。
             debug("LearningManager resetLearning: Failed to save LongTermLearningMemory", error)
@@ -1165,15 +1229,24 @@ final class LearningManager {
         if let chars = Self.keyToChars(target.reading, char2UInt8: char2UInt8) {
             self.temporaryMemory.forget(exactly: target, chars: chars)
         }
-        try LongTermLearningMemory.mergeExactlyForgetting(
-            tempTrie: self.temporaryMemory,
-            target: target,
-            directoryURL: memoryURL,
-            maxMemoryCount: self.config.maxMemoryCount,
-            char2UInt8: char2UInt8
-        )
+        // save()と同じく、成功・失敗のいずれでも破壊状態の判定を更新する
+        defer {
+            self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
+        }
+        do {
+            try LongTermLearningMemory.mergeExactlyForgetting(
+                tempTrie: self.temporaryMemory,
+                target: target,
+                directoryURL: memoryURL,
+                maxMemoryCount: self.config.maxMemoryCount,
+                char2UInt8: char2UInt8
+            )
+        } catch LongTermLearningMemory.UpdateError.interruptedAfterPause(let error) {
+            // temporaryMemoryの内容は`.2`のファイルに含まれ、次回の`merge`で復元されるため、二重に学習しないよう空にする
+            self.temporaryMemory = TemporalLearningMemoryTrie()
+            throw error
+        }
         self.temporaryMemory = TemporalLearningMemoryTrie()
-        self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
     }
 
     func learningMemoryEntries(offset: Int, limit: Int) throws -> LearningMemoryPage {
@@ -1204,7 +1277,8 @@ final class LearningManager {
             debug(#function, "config.learningType=\(self.config.learningType as _?)", "skip memory update")
             return false
         }
-        guard !self.temporaryMemory.isEmpty else {
+        // `.pause`が残っている場合は、pending が空でも`.2`のファイルを復元するためにマージする
+        guard !self.temporaryMemory.isEmpty || LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL) else {
             debug(#function, "skip because there is no pending memory")
             return false
         }
@@ -1213,7 +1287,14 @@ final class LearningManager {
             self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
         }
         // マージが済んだ場合のみ temporaryMemory を空にする。失敗時は保持して再送出する。
-        try LongTermLearningMemory.merge(tempTrie: self.temporaryMemory, directoryURL: memoryURL, maxMemoryCount: self.config.maxMemoryCount, char2UInt8: char2UInt8)
+        // ただし`.pause`を書き出した後の失敗では、pending は`.2`のファイルに含まれ次回の`merge`で復元されるため、
+        // 保持すると再送出後の再試行で二重に学習される。この場合は空にしてから再送出する。
+        do {
+            try LongTermLearningMemory.merge(tempTrie: self.temporaryMemory, directoryURL: memoryURL, maxMemoryCount: self.config.maxMemoryCount, char2UInt8: char2UInt8)
+        } catch LongTermLearningMemory.UpdateError.interruptedAfterPause(let error) {
+            self.temporaryMemory = TemporalLearningMemoryTrie()
+            throw error
+        }
         self.temporaryMemory = TemporalLearningMemoryTrie()
         return true
     }

@@ -314,6 +314,42 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertTrue(keys.contains { $0.word == "テスト" })
     }
 
+    func testSaveFailureAfterPauseDoesNotDoubleCountPendingMemoryOnRetry() throws {
+        let dir = try makeTemporaryDirectory()
+        let loudsURL = dir.appendingPathComponent("memory.louds", isDirectory: false)
+        let lockedURL = loudsURL.appendingPathComponent("locked", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: lockedURL.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+        try persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+
+        let element = DicdataElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+        state.learningMemoryManager.update(data: [element])
+
+        // `.pause`の書き出し後に最後に上書きされる memory.louds を、削除できないディレクトリに置き換える
+        try FileManager.default.removeItem(at: loudsURL)
+        try FileManager.default.createDirectory(at: lockedURL, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: lockedURL.appendingPathComponent("file").path, contents: Data())
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: lockedURL.path)
+        try XCTSkipIf(FileManager.default.isWritableFile(atPath: lockedURL.path), "root ignores the permission used to inject the failure")
+
+        XCTAssertThrowsError(try state.learningMemoryManager.save())
+        XCTAssertTrue(LongTermLearningMemory.memoryCollapsed(directoryURL: dir))
+
+        // 置き換えを可能に戻して再試行すると、`.2`のファイルの復元によって pending が1回分だけ反映される
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: lockedURL.path)
+        try FileManager.default.removeItem(at: loudsURL)
+        XCTAssertTrue(try state.learningMemoryManager.save())
+        XCTAssertFalse(LongTermLearningMemory.memoryCollapsed(directoryURL: dir))
+
+        let entries = try state.learningMemoryEntriesSinglePass(limit: 65_536).entries
+        XCTAssertEqual(entries.filter { $0.data.word == "テスト" }.map(\.count), [2])
+    }
+
     func testPersistedLearningMemoryKeysThrowsMalformedShardWhenShardIsMissing() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -330,6 +366,186 @@ final class LearningMemoryTests: XCTestCase {
         freshState.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
         XCTAssertThrowsError(try freshState.persistedLearningMemoryKeys(exactReadings: ["テスト"])) { error in
             XCTAssertEqual(error as? LearningMemoryEnumerationError, .malformedShard)
+        }
+    }
+
+    /// 現在のプロセスの仮想メモリの最大値 (KiB) を返す。読めない環境ではnil
+    private static func peakVirtualMemoryKiB() -> Int? {
+        guard let status = try? String(contentsOfFile: "/proc/self/status", encoding: .utf8) else {
+            return nil
+        }
+        for line in status.split(separator: "\n") where line.hasPrefix("VmPeak:") {
+            return Int(line.split(whereSeparator: { $0 == " " || $0 == "\t" })[1])
+        }
+        return nil
+    }
+
+    func testEnumerationRejectsHugeMetadataNodeCountBeforeAllocating() throws {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+
+        // 先頭4byteのノード数だけが壊れたメタデータ (実際のノードは1つ)
+        var metadata = Data([0xFF, 0xFF, 0xFF, 0xFF])
+        metadata.append(0)
+        try metadata.write(to: dir.appendingPathComponent("memory.memorymetadata", isDirectory: false))
+
+        let peakBefore = Self.peakVirtualMemoryKiB()
+        XCTAssertThrowsError(try state.learningMemoryEntriesSinglePass(limit: 65_536)) { error in
+            XCTAssertEqual(error as? LearningMemoryEnumerationError, .malformedMetadata)
+        }
+        // ノード数どおりに確保すると数十GBの仮想メモリを要求する
+        if let peakBefore, let peakAfter = Self.peakVirtualMemoryKiB() {
+            XCTAssertLessThan(peakAfter - peakBefore, 1 << 20, "VmPeak grew by \(peakAfter - peakBefore) KiB")
+        }
+    }
+
+    /// 長期記憶を持つ学習ディレクトリを作り、ファイルを壊してから新しい学習を保存する
+    private func saveAfterCorrupting(_ corrupt: (URL) throws -> Void) throws -> (saved: Bool, words: Set<String>, collapsed: Bool) {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+        try persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
+        try persistElement(word: "藍", ruby: "アイ", cid: CIDData.一般名詞.cid, into: state)
+
+        try corrupt(dir)
+
+        let freshState = dicdataStore.prepareState()
+        freshState.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
+        freshState.learningMemoryManager.update(data: [
+            DicdataElement(word: "上", ruby: "ウエ", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+        ])
+        let saved = try freshState.learningMemoryManager.save()
+        let words = Set(try freshState.learningMemoryEntriesSinglePass(limit: 65_536).entries.map(\.data.word))
+        return (saved, words, LongTermLearningMemory.memoryCollapsed(directoryURL: dir))
+    }
+
+    func testSaveSkipsTruncatedShardInsteadOfTrapping() throws {
+        let result = try saveAfterCorrupting { dir in
+            let shardURL = dir.appendingPathComponent("memory0.loudstxt3", isDirectory: false)
+            try Data(contentsOf: shardURL).prefix(1).write(to: shardURL)
+        }
+        XCTAssertTrue(result.saved)
+        XCTAssertFalse(result.collapsed)
+        XCTAssertEqual(result.words, ["上"])
+    }
+
+    func testSaveSkipsShardWhoseIndexTableIsCutShort() throws {
+        let result = try saveAfterCorrupting { dir in
+            let shardURL = dir.appendingPathComponent("memory0.loudstxt3", isDirectory: false)
+            try Data(contentsOf: shardURL).prefix(4).write(to: shardURL)
+        }
+        XCTAssertTrue(result.saved)
+        XCTAssertFalse(result.collapsed)
+        XCTAssertEqual(result.words, ["上"])
+    }
+
+    func testSaveStopsAtTruncatedMetadataInsteadOfTrapping() throws {
+        let result = try saveAfterCorrupting { dir in
+            let metadataURL = dir.appendingPathComponent("memory.memorymetadata", isDirectory: false)
+            let metadata = try Data(contentsOf: metadataURL)
+            try metadata.prefix(metadata.count - 1).write(to: metadataURL)
+        }
+        XCTAssertTrue(result.saved)
+        XCTAssertFalse(result.collapsed)
+        XCTAssertTrue(result.words.contains("上"))
+    }
+
+    func testSaveTreatsMetadataShorterThanHeaderAsEmpty() throws {
+        let result = try saveAfterCorrupting { dir in
+            let metadataURL = dir.appendingPathComponent("memory.memorymetadata", isDirectory: false)
+            try Data([0x02, 0x00]).write(to: metadataURL)
+        }
+        XCTAssertTrue(result.saved)
+        XCTAssertFalse(result.collapsed)
+        XCTAssertEqual(result.words, ["上"])
+    }
+
+    func testSaveKeepsMetadataAlignedAfterSkippingUnreadableShard() throws {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let config = LearningConfig(learningType: .inputAndOutput, maxMemoryCount: 10_000, memoryURL: dir)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(config)
+
+        // 2文字の読み 50 x 50 件で、ノード数 (ダミー2 + 1文字目50 + 2文字目2500) を2シャードに分ける
+        let kana = Array("アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲンガギグゲ")
+        XCTAssertEqual(kana.count, 50)
+        let rubies = kana.flatMap { first in kana.map { String([first, $0]) } }
+        // 1語ずつ渡す (まとめて渡すと文節bigramも学習される)
+        for ruby in rubies {
+            state.learningMemoryManager.update(data: [
+                DicdataElement(word: ruby, ruby: ruby, cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+            ])
+        }
+        XCTAssertTrue(try state.learningMemoryManager.save())
+        XCTAssertEqual(try state.learningMemoryEntriesSinglePass(limit: 65_536).totalCount, rubies.count)
+        let secondShardURL = dir.appendingPathComponent("memory1.loudstxt3", isDirectory: false)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secondShardURL.path))
+
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("memory0.loudstxt3", isDirectory: false))
+        let freshState = dicdataStore.prepareState()
+        freshState.updateLearningConfig(config)
+        freshState.learningMemoryManager.update(data: [
+            DicdataElement(word: "上", ruby: "ウエ", cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: -10)
+        ])
+        XCTAssertTrue(try freshState.learningMemoryManager.save())
+
+        // 1つ目のシャードの2文字目のノード (2048 - ダミー2 - 1文字目50 = 1996件) だけが失われ、2つ目のシャードの学習は残る
+        let entries = try freshState.learningMemoryEntriesSinglePass(limit: 65_536).entries
+        XCTAssertEqual(entries.count, rubies.count - 1996 + 1)
+        XCTAssertTrue(entries.contains { $0.data.word == "上" })
+    }
+
+    func testSaveSkipsShardWhoseNodeCountFieldIsCorrupted() throws {
+        let dir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dicdataStore = DicdataStore(dictionaryURL: Self.resourceURL)
+        let config = LearningConfig(learningType: .inputAndOutput, maxMemoryCount: 10_000, memoryURL: dir)
+        let state = dicdataStore.prepareState()
+        state.updateLearningConfig(config)
+
+        // 2文字の読み 50 x 50 件を2シャードに分け、2文字目が「ア」の語だけ2回学習して、メタデータの対応のずれを回数で見分けられるようにする
+        let kana = Array("アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲンガギグゲ")
+        let rubies = kana.flatMap { first in kana.map { String([first, $0]) } }
+        let learnedTwice = { (ruby: String) in ruby.last == "ア" }
+        for ruby in rubies {
+            for _ in 0 ..< (learnedTwice(ruby) ? 2 : 1) {
+                state.learningMemoryManager.update(data: [
+                    DicdataElement(word: ruby, ruby: ruby, cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+                ])
+            }
+        }
+        XCTAssertTrue(try state.learningMemoryManager.save())
+        let saved = try state.learningMemoryEntriesSinglePass(limit: 65_536).entries
+        XCTAssertEqual(saved.count, rubies.count)
+        XCTAssertEqual(saved.filter { $0.count == 2 }.count, kana.count)
+
+        // 1つ目のシャードの件数 (2048) だけを1減らす。索引表はファイルに収まったまま読める
+        let firstShardURL = dir.appendingPathComponent("memory0.loudstxt3", isDirectory: false)
+        var firstShard = try Data(contentsOf: firstShardURL)
+        XCTAssertEqual(Array(firstShard.prefix(2)), [0x00, 0x08])
+        firstShard.replaceSubrange(firstShard.startIndex ..< firstShard.startIndex + 2, with: [0xFF, 0x07])
+        try firstShard.write(to: firstShardURL)
+
+        let freshState = dicdataStore.prepareState()
+        freshState.updateLearningConfig(config)
+        freshState.learningMemoryManager.update(data: [
+            DicdataElement(word: "上", ruby: "ウエ", cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: -10)
+        ])
+        XCTAssertTrue(try freshState.learningMemoryManager.save())
+
+        // 1つ目のシャードだけを捨て、2つ目のシャードの語は自身の回数を保つ
+        let entries = try freshState.learningMemoryEntriesSinglePass(limit: 65_536).entries
+        XCTAssertEqual(entries.count, rubies.count - 1996 + 1)
+        XCTAssertTrue(entries.contains { $0.data.word == "上" })
+        for entry in entries where entry.data.word != "上" {
+            XCTAssertEqual(entry.count, learnedTwice(entry.data.ruby) ? 2 : 1, entry.data.ruby)
         }
     }
 }
