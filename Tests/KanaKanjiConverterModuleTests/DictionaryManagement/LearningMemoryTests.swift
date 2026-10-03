@@ -107,18 +107,35 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertFalse(dicdata2.contains { $0.word == element.word && $0.ruby == element.ruby })
     }
 
+    /// 検証用の一時学習ディレクトリを作る
+    ///
+    /// 呼び出し側が使い終わったら削除する
+    ///
+    /// - Returns: 作成した空ディレクトリのURL
     private func makeTemporaryDirectory() throws -> URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("LearningMemoryTest-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
 
+    /// 1語だけを永続化した状態を作る
+    ///
+    /// 未確定のまま残さず保存まで行い、照会系の前提条件を整える
+    ///
+    /// - Parameters:
+    ///   - word: 表記
+    ///   - ruby: 読み
+    ///   - cid: 品詞ID
+    ///   - state: 学習設定済みの辞書状態
     private func persistElement(word: String, ruby: String, cid: Int, into state: DicdataStoreState) throws {
         let element = DicdataElement(word: word, ruby: ruby, cid: cid, mid: MIDData.一般.mid, value: -10)
         state.learningMemoryManager.update(data: [element])
         try state.learningMemoryManager.save()
     }
 
+    /// 設定更新が記憶URL変更時のみ再読み込みを報告することを検証する
+    ///
+    /// 同じ記憶先の再設定では無駄な読み直しをせず、記憶先が変わったときと学習無効化のときだけ再読み込みする
     func testUpdateConfigReportsCacheResetOnlyWhenMemoryURLChanges() throws {
         let dirA = try makeTemporaryDirectory()
         let dirB = try makeTemporaryDirectory()
@@ -134,6 +151,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertTrue(manager.updateConfig(.init(learningType: .nothing, maxMemoryCount: 32, memoryURL: dirB)))
     }
 
+    /// 記憶先の切り替えで古い記憶の読み出しが混ざらないことを検証する
+    ///
+    /// 別ディレクトリの学習語が前の記憶先の照会に現れず、切り替え先の語だけが当たる
     func testMemoryURLChangeInvalidatesCachedMemoryLOUDS() throws {
         let dirA = try makeTemporaryDirectory()
         let dirB = try makeTemporaryDirectory()
@@ -161,6 +181,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["ウエ"]).map(\.word), ["上"])
     }
 
+    /// 同一読み表記の品詞違いを全て返すことを検証する
+    ///
+    /// 候補注釈と削除は品詞違いも区別するため、点照会で変種を落とさない
     func testPersistedLearningMemoryKeysReturnsEveryCidVariant() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -180,6 +203,9 @@ final class LearningMemoryTests: XCTestCase {
         )
     }
 
+    /// 未知文字と未登録読みを空で返すことを検証する
+    ///
+    /// 照合表に無い文字は読み出し前に棄却し、未登録の読みも空になる
     func testPersistedLearningMemoryKeysRejectsUnknownCharacterAndAbsentReading() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -188,12 +214,15 @@ final class LearningMemoryTests: XCTestCase {
         state.updateLearningConfig(self.getConfigForMemoryTest(memoryURL: dir))
         try persistElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, into: state)
 
-        // charID.chid に無い文字は trie に存在し得ないので、シャードを読まずに棄却される
+        // charID.chidに無い文字はtrieに存在し得ないので、シャードを読まずに棄却される
         XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["🍣"]), [])
         XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["アイ"]), [])
         XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: []), [])
     }
 
+    /// 未確定の一時記憶を照会対象外にすることを検証する
+    ///
+    /// 点照会は永続化済みだけを見て、保存前の学習語を注釈や削除に使わない
     func testPersistedLearningMemoryKeysIgnoresUncommittedTemporalMemory() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -209,6 +238,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertEqual(try state.persistedLearningMemoryKeys(exactReadings: ["テスト"]).map(\.word), ["テスト"])
     }
 
+    /// 中断中の写しへの照会が失敗することを検証する
+    ///
+    /// pause中の不完全な永続記憶を読まず、一時停止を示す失敗で知らせる
     func testPersistedLearningMemoryKeysThrowsOnPausedSnapshot() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -226,6 +258,9 @@ final class LearningMemoryTests: XCTestCase {
         }
     }
 
+    /// 単一走査の列挙が上限と全体件数を正しく返すことを検証する
+    ///
+    /// 上限内の要求は全件と次位置なしを返し、上限超過では切り詰め件数と次位置を返す
     func testSinglePassEnumerationHonorsLimitWithoutClamping() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -284,6 +319,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertFalse(dicdata2.contains { $0.word == element.word && $0.ruby == element.ruby })
     }
 
+    /// 保存失敗を伝えて未保存の学習を保つことを検証する
+    ///
+    /// 書き込みに失敗しても成功扱いにせず、保留中の学習を捨てずに次回の保存で書き出す
     func testSavePropagatesWriteFailureAndRetainsPendingMemory() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -314,6 +352,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertTrue(keys.contains { $0.word == "テスト" })
     }
 
+    /// 中断後失敗の再試行で保留分を二重加算しないことを検証する
+    ///
+    /// pause作成後の失敗では書き出し済みの内容が次回に復元されるため、保留分を捨てて二重加算を防ぐ
     func testSaveFailureAfterPauseDoesNotDoubleCountPendingMemoryOnRetry() throws {
         let dir = try makeTemporaryDirectory()
         let loudsURL = dir.appendingPathComponent("memory.louds", isDirectory: false)
@@ -330,7 +371,7 @@ final class LearningMemoryTests: XCTestCase {
         let element = DicdataElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
         state.learningMemoryManager.update(data: [element])
 
-        // `.pause`の書き出し後に最後に上書きされる memory.louds を、削除できないディレクトリに置き換える
+        // pauseの書き出し後に最後に上書きされるmemory.loudsを、削除できないディレクトリに置き換える
         try FileManager.default.removeItem(at: loudsURL)
         try FileManager.default.createDirectory(at: lockedURL, withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: lockedURL.appendingPathComponent("file").path, contents: Data())
@@ -340,7 +381,7 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertThrowsError(try state.learningMemoryManager.save())
         XCTAssertTrue(LongTermLearningMemory.memoryCollapsed(directoryURL: dir))
 
-        // 置き換えを可能に戻して再試行すると、`.2`のファイルの復元によって pending が1回分だけ反映される
+        // 置き換えを可能に戻して再試行すると、接尾辞2のファイルの復元によって保留分が1回分だけ反映される
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: lockedURL.path)
         try FileManager.default.removeItem(at: loudsURL)
         XCTAssertTrue(try state.learningMemoryManager.save())
@@ -350,6 +391,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertEqual(entries.filter { $0.data.word == "テスト" }.map(\.count), [2])
     }
 
+    /// 欠けた破片への点照会が失敗することを検証する
+    ///
+    /// 存在しない破片を読もうとせず、破損を示す失敗で知らせる
     func testPersistedLearningMemoryKeysThrowsMalformedShardWhenShardIsMissing() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -369,7 +413,11 @@ final class LearningMemoryTests: XCTestCase {
         }
     }
 
-    /// 現在のプロセスの仮想メモリの最大値 (KiB) を返す。読めない環境ではnil
+    /// 現在のプロセスの仮想メモリの最大値をKiB単位で返す
+    ///
+    /// 読めない環境ではnilを返す
+    ///
+    /// - Returns: VmPeakの値、読めない環境ではnil
     private static func peakVirtualMemoryKiB() -> Int? {
         guard let status = try? String(contentsOfFile: "/proc/self/status", encoding: .utf8) else {
             return nil
@@ -380,6 +428,9 @@ final class LearningMemoryTests: XCTestCase {
         return nil
     }
 
+    /// 巨大な件数を持つ壊れた付随情報を確保前に拒むことを検証する
+    ///
+    /// 件数どおりに確保すると数十GB級の仮想記憶を要求するため、読み出し前に検証して失敗する
     func testEnumerationRejectsHugeMetadataNodeCountBeforeAllocating() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -403,6 +454,11 @@ final class LearningMemoryTests: XCTestCase {
     }
 
     /// 長期記憶を持つ学習ディレクトリを作り、ファイルを壊してから新しい学習を保存する
+    ///
+    /// 壊れた破片は捨てて新しい学習だけを保存し、破壊状態に陥らない
+    ///
+    /// - Parameter corrupt: 学習ディレクトリ内のファイルを壊す処理
+    /// - Returns: 保存成否と保存後の表記集合と破壊状態の有無
     private func saveAfterCorrupting(_ corrupt: (URL) throws -> Void) throws -> (saved: Bool, words: Set<String>, collapsed: Bool) {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -424,6 +480,9 @@ final class LearningMemoryTests: XCTestCase {
         return (saved, words, LongTermLearningMemory.memoryCollapsed(directoryURL: dir))
     }
 
+    /// 切り詰められた破片を読み飛ばして保存することを検証する
+    ///
+    /// 壊れた破片があっても捕捉不能な落ち方をせず、新しい学習だけを保存する
     func testSaveSkipsTruncatedShardInsteadOfTrapping() throws {
         let result = try saveAfterCorrupting { dir in
             let shardURL = dir.appendingPathComponent("memory0.loudstxt3", isDirectory: false)
@@ -434,6 +493,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertEqual(result.words, ["上"])
     }
 
+    /// 索引表が途切れた破片を読み飛ばして保存することを検証する
+    ///
+    /// 索引表が短い破片があっても捕捉不能な落ち方をせず、新しい学習だけを保存する
     func testSaveSkipsShardWhoseIndexTableIsCutShort() throws {
         let result = try saveAfterCorrupting { dir in
             let shardURL = dir.appendingPathComponent("memory0.loudstxt3", isDirectory: false)
@@ -444,6 +506,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertEqual(result.words, ["上"])
     }
 
+    /// 途切れた付随情報で止まって保存することを検証する
+    ///
+    /// 付随情報が途中で切れていても捕捉不能な落ち方をせず、読める範囲で新しい学習を保存する
     func testSaveStopsAtTruncatedMetadataInsteadOfTrapping() throws {
         let result = try saveAfterCorrupting { dir in
             let metadataURL = dir.appendingPathComponent("memory.memorymetadata", isDirectory: false)
@@ -455,6 +520,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertTrue(result.words.contains("上"))
     }
 
+    /// 表題より短い付随情報を空として扱うことを検証する
+    ///
+    /// 件数すら読めない付随情報は記憶なしとみなし、新しい学習を保存する
     func testSaveTreatsMetadataShorterThanHeaderAsEmpty() throws {
         let result = try saveAfterCorrupting { dir in
             let metadataURL = dir.appendingPathComponent("memory.memorymetadata", isDirectory: false)
@@ -465,6 +533,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertEqual(result.words, ["上"])
     }
 
+    /// 読めない破片を捨てても付随情報の対応を保つことを検証する
+    ///
+    /// 残った破片の学習回数は変わらず、新しい学習も正しく加わる
     func testSaveKeepsMetadataAlignedAfterSkippingUnreadableShard() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -502,6 +573,9 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertTrue(entries.contains { $0.data.word == "上" })
     }
 
+    /// 件数欄が壊れた破片を捨てて保存することを検証する
+    ///
+    /// 件数だけが壊れた破片は索引表が読めても捨て、残りの破片の学習回数を保つ
     func testSaveSkipsShardWhoseNodeCountFieldIsCorrupted() throws {
         let dir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -526,7 +600,8 @@ final class LearningMemoryTests: XCTestCase {
         XCTAssertEqual(saved.count, rubies.count)
         XCTAssertEqual(saved.filter { $0.count == 2 }.count, kana.count)
 
-        // 1つ目のシャードの件数 (2048) だけを1減らす。索引表はファイルに収まったまま読める
+        // 1つ目のシャードの件数 (2048) だけを1減らす
+        // 索引表はファイルに収まったまま読める
         let firstShardURL = dir.appendingPathComponent("memory0.loudstxt3", isDirectory: false)
         var firstShard = try Data(contentsOf: firstShardURL)
         XCTAssertEqual(Array(firstShard.prefix(2)), [0x00, 0x08])

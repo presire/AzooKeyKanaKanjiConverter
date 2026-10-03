@@ -81,6 +81,11 @@ extension Kana2Kanji {
             )
         }
 
+        /// 明示的に受け入れた先頭候補だけを残し他のキャッシュ内容を破棄したコピーを返す
+        ///
+        /// 補助辞書の切替などで辞書由来の変換結果が無効になる場合に使い制約と確定候補とラティスは捨てる
+        ///
+        /// - Returns: 受け入れた先頭候補だけを持つZenzaiCache
         func keepingOnlyAcceptedPrefix() -> ZenzaiCache {
             ZenzaiCache(
                 self.inputData,
@@ -93,8 +98,8 @@ extension Kana2Kanji {
             )
         }
 
-        func getNewConstraint(for newInputData: ComposingText) -> PrefixConstraint {
-            self.fixingPrefix(self.getReplaceableConstraint(for: newInputData), for: newInputData)
+        func getNewConstraint(for newInputData: ComposingText, userDictionary: [DicdataElement]) -> PrefixConstraint {
+            self.fixingPrefix(self.getReplaceableConstraint(for: newInputData, userDictionary: userDictionary), for: newInputData)
         }
 
         /// 先頭の候補の読みが入力の先頭にそのまま残っていればその候補。残っていなければ nil で、以降は引き継がない。
@@ -126,23 +131,72 @@ extension Kana2Kanji {
         }
 
         /// モデルの評価で置き換わりうる制約。
-        private func getReplaceableConstraint(for newInputData: ComposingText) -> PrefixConstraint {
+        private func getReplaceableConstraint(for newInputData: ComposingText, userDictionary: [DicdataElement]) -> PrefixConstraint {
+            let newReading = Array(newInputData.convertTarget.toKatakana())
             if let satisfyingCandidate {
-                var current = newInputData.convertTarget.toKatakana()[...]
+                let evaluatedReading = satisfyingCandidate.data.map(\.ruby).joined()
+                let cutoff = Self.userDictionaryWordStart(
+                    in: newReading,
+                    completedAfter: Self.commonPrefixCount(newReading, evaluatedReading),
+                    userDictionary: userDictionary
+                )
+                var current = newReading[...]
+                var consumedCount = 0
                 var constraint = [UInt8]()
                 for item in satisfyingCandidate.data {
-                    if current.hasPrefix(item.ruby) {
+                    if current.starts(with: item.ruby) {
+                        if let cutoff, consumedCount + item.ruby.count > cutoff {
+                            break
+                        }
                         constraint += item.word.utf8
                         current = current.dropFirst(item.ruby.count)
+                        consumedCount += item.ruby.count
                     }
                 }
                 return PrefixConstraint(constraint)
             } else if newInputData.convertTarget.hasPrefix(inputData.convertTarget) {
+                let evaluatedCount = inputData.convertTarget.count
+                if let cutoff = Self.userDictionaryWordStart(in: newReading, completedAfter: evaluatedCount, userDictionary: userDictionary),
+                   cutoff < evaluatedCount {
+                    // 制約の表記と読みの対応が分からないため、語の手前で切れない
+                    return PrefixConstraint([])
+                }
                 // hasEOSの場合は落とすために改めて作り直す
                 return PrefixConstraint(self.prefixConstraint.constraint)
             } else {
                 return PrefixConstraint([])
             }
+        }
+
+        // [Hazkey Community Patch]
+        // 前回の評価の後で読みが揃ったユーザ辞書の語の開始位置 (該当する語が無ければ nil)
+        // 前回の評価ではその語が候補に現れず、モデルに辞書の語として示されていない
+        // そのまま前回の表記 (ひらがなのことが多い) を制約に残すと、制約がラティスからその語を締め出し、
+        // 以後の評価でも語が候補に現れず、表記が固定される
+        // 語の開始位置より前だけを制約に残し、語の部分はモデルに評価し直させる
+        static func userDictionaryWordStart(in reading: [Character], completedAfter evaluatedCount: Int, userDictionary: [DicdataElement]) -> Int? {
+            var earliest: Int?
+            for element in userDictionary {
+                let ruby = Array(element.ruby)
+                guard !ruby.isEmpty, ruby.count <= reading.count else {
+                    continue
+                }
+                // 語の終端が前回の評価済みの読みを越える開始位置だけを調べる
+                let lowerBound = max(0, evaluatedCount - ruby.count + 1)
+                let upperBound = min(reading.count - ruby.count, (earliest ?? reading.count) - 1)
+                guard lowerBound <= upperBound else {
+                    continue
+                }
+                for start in lowerBound ... upperBound where reading[start ..< start + ruby.count].elementsEqual(ruby) {
+                    earliest = start
+                    break
+                }
+            }
+            return earliest
+        }
+
+        private static func commonPrefixCount(_ lhs: [Character], _ rhs: String) -> Int {
+            zip(lhs, rhs).prefix { $0 == $1 }.count
         }
 
         func getPreprocessedLattice(for newInputData: ComposingText, kanaKanji: Kana2Kanji, dicdataStoreState: DicdataStoreState) -> Lattice? {
@@ -208,10 +262,11 @@ extension Kana2Kanji {
         versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
         dicdataStoreState: DicdataStoreState
     ) -> (result: LatticeNode, lattice: Lattice, cache: ZenzaiCache) {
-        // [hazkey-community patch] opt-in Zenzai CPU latency deadline (HAZKEY_ZENZAI_DEADLINE_MS)
+        // [Hazkey Community Patch]
+        // 任意のCPU遅延期限 (HAZKEY_ZENZAI_DEADLINE_MS) の監視窓を開く
         ZenzInferencePerf.shared.beginDeadlineWindow()
-        // [hazkey-community patch] jinen (Qwen3) は NFKC 正規化空間で出力するため、
-        // 辞書表記との制約比較を NFKC 正規化して行う (fixRequired/wholeResult の空振り防止)。
+        // [Hazkey Community Patch]
+        // jinen (Qwen3) はNFKC正規化空間で出力するため、辞書表記との制約比較をNFKC正規化して行う (fixRequired/wholeResultの空振り防止)
         let isJinen = zenz.isJinenModel
         let latticeInputData = Self.zenzaiLatticeInputData(for: inputData)
         let zenzInputCursorPosition = Self.zenzaiInputCursorPosition(for: inputData)
@@ -222,7 +277,10 @@ extension Kana2Kanji {
                 composingText: inputData,
                 inputStyle: inputStyle
             ).droppedSuffixCount > 0
-        var constraint = zenzaiCache?.getNewConstraint(for: latticeInputData) ?? PrefixConstraint([])
+        var constraint = zenzaiCache?.getNewConstraint(
+            for: latticeInputData,
+            userDictionary: dicdataStoreState.dynamicUserDictionary
+        ) ?? PrefixConstraint([])
         let prefixCandidate = zenzaiCache?.prefixCandidate(remainingIn: latticeInputData)
         let resolvedConversionCacheKey: ZenzResolvedConversionCacheKey? =
             if !requestRichCandidates,
@@ -334,6 +392,7 @@ extension Kana2Kanji {
                 )
             }
             let draftResult: (result: LatticeNode, lattice: Lattice)
+            let draftStartedAt = ZenzInferencePerf.shared.now()
             if let cachedDraft {
                 let cachedLattice = Lattice(
                     inputCount: latticeInputData.input.count,
@@ -369,6 +428,13 @@ extension Kana2Kanji {
                     preprocessedLattice: preprocessedLattice,
                     dicdataStoreState: dicdataStoreState
                 )
+            }
+            if cachedDraft == nil {
+                let draftNanoseconds = ZenzInferencePerf.shared.elapsed(since: draftStartedAt)
+                ZenzInferencePerf.shared.count {
+                    $0.draftCount += 1
+                    $0.draftNanoseconds &+= draftNanoseconds
+                }
             }
             if let draftCacheKey, cachedDraft == nil {
                 zenzaiMemoizationCache.cacheDraftConversion(
@@ -417,9 +483,9 @@ extension Kana2Kanji {
                     // When inference occurs more than maximum times, then just return result at this point
                     return (eosNode, lattice, makeCache(constraint: constraint, satisfyingCandidate: candidate))
                 }
-                // [hazkey-community patch] opt-in Zenzai CPU latency deadline
-                // (HAZKEY_ZENZAI_DEADLINE_MS): on expiry, fall back to non-neural candidates
-                // using the same early-return shape as the inferenceLimit==0 branch above.
+                // [Hazkey Community Patch]
+                // 任意のCPU遅延期限 (HAZKEY_ZENZAI_DEADLINE_MS) が切れたら非ニューラル候補へフォールバックする
+                // 直前のinferenceLimit==0分岐と同じ早期復帰の形を取る
                 if ZenzInferencePerf.shared.deadlineExpired() {
                     debug("HAZKEY_ZENZAI_DEADLINE_MS exceeded! \(candidate.text) is used for excuse")
                     return (eosNode, lattice, makeCache(constraint: constraint, satisfyingCandidate: candidate))
@@ -454,6 +520,7 @@ extension Kana2Kanji {
                     memoizationCache: zenzaiMemoizationCache
                 )
                 inferenceLimit -= 1
+                ZenzInferencePerf.shared.count { $0.evaluationCount += 1 }
                 let nextAction = self.review(
                     candidateIndex: index,
                     candidates: candidates,
@@ -483,6 +550,7 @@ extension Kana2Kanji {
                             } else if alternativeConstraint.probabilityRatio > 0.5 {
                                 // 十分に高い確率の場合、変換器を実際に呼び出して候補を作ってもらう
                                 lattice.resetNodeStates()
+                                let alternativeDraftStartedAt = ZenzInferencePerf.shared.now()
                                 let draftResult = self.kana2lattice_all_with_prefix_constraint(
                                     latticeInputData,
                                     N_best: 3,
@@ -490,6 +558,11 @@ extension Kana2Kanji {
                                     preprocessedLattice: lattice,
                                     dicdataStoreState: dicdataStoreState
                                 )
+                                let alternativeDraftNanoseconds = ZenzInferencePerf.shared.elapsed(since: alternativeDraftStartedAt)
+                                ZenzInferencePerf.shared.count {
+                                    $0.alternativeDraftCount += 1
+                                    $0.draftNanoseconds &+= alternativeDraftNanoseconds
+                                }
                                 let candidates = draftResult.result.getCandidateData().map(self.processClauseCandidate)
                                 let best: (Int, Candidate)? = candidates.enumerated().reduce(into: (Int, Candidate)?.none) { best, pair in
                                     if let (_, c) = best, pair.1.value > c.value {
@@ -545,12 +618,14 @@ extension Kana2Kanji {
                         return (eosNode, lattice, makeCache(constraint: constraint, satisfyingCandidate: nil))
                     }
                 case .continue:
+                    ZenzInferencePerf.shared.count { $0.redraftCount += 1 }
                     if !latticeIsComplete {
                         lattice = Lattice()
                         latticeIsComplete = true
                     }
                     break reviewLoop
                 case .retry(let candidateIndex):
+                    ZenzInferencePerf.shared.count { $0.retryCount += 1 }
                     index = candidateIndex
                     candidate = candidates[candidateIndex]
                 }
@@ -572,9 +647,18 @@ extension Kana2Kanji {
         inputData.isAtEndIndex ? nil : inputData.convertTargetCursorPosition
     }
 
-    // [hazkey-community patch] 解決済み変換キャッシュのキーを組み立てる。
-    // ラティス入力 (カーソルまで) だけをキーにすると、カーソルより前の読みが同じで
-    // 右側の読みが違う入力が同じ結果を共有してしまうため、評価に使った全文の読みも含める。
+    /// 解決済み変換キャッシュのキーを組み立てる
+    ///
+    /// ラティス入力 (カーソルまで) だけをキーにするとカーソルより前の読みが同じで右側の読みが違う入力が同じ結果を共有してしまうため評価に使った全文の読みも含める
+    ///
+    /// - Parameters:
+    ///   - inputData: 変換対象の入力
+    ///   - keyboardLanguage: キーボード言語
+    ///   - versionDependentConfig: バージョン別モード
+    ///   - prefixConstraint: 先頭制約
+    ///   - inferenceLimit: 推論回数の上限
+    /// - Returns: 解決済み変換キャッシュのキー
+    /// - Note: [Hazkey Community Patch]
     static func resolvedConversionCacheKey(
         for inputData: ComposingText,
         keyboardLanguage: KeyboardLanguage,
@@ -622,10 +706,10 @@ extension Kana2Kanji {
                 if !constraint.ignoreMemoryAndUserDictionary,
                    candidates[candidateIndex].data.contains(where: { !$0.metadata.isDisjoint(with: [.isLearned]) }),
                    candidates[candidateIndex].data.allSatisfy({ $0.metadata.isDisjoint(with: [.isFromUserDictionary]) }) {
-                    // [hazkey-community patch] Preserve explicitly registered user-dictionary candidates.
-                    // A repeated identical constraint must use the existing give-up path when it
-                    // contains a user-dictionary entry; retain this retry only for learned entries.
-                    // `ignoreMemoryAndUserDictionary`でない場合、学習候補がモデルにリジェクトされた可能性を検討する
+                    // [Hazkey Community Patch]
+                    // 明示的に登録されたユーザ辞書候補を保持する
+                    // 同じ制約の繰り返しはユーザ辞書エントリを含む場合既存の諦め経路を使い学習エントリだけがこのリトライを残す
+                    // ignoreMemoryAndUserDictionaryでない場合、学習候補がモデルにリジェクトされた可能性を検討する
                     debug("same constraint (fixRequired), but retry without memory and user dictionary:", newConstraint)
                     constraint.ignoreMemoryAndUserDictionary = true
                     for (i, candidate) in candidates.indexed() where i != candidateIndex {
@@ -669,10 +753,10 @@ extension Kana2Kanji {
                 if !constraint.ignoreMemoryAndUserDictionary,
                    candidates[candidateIndex].data.contains(where: { !$0.metadata.isDisjoint(with: [.isLearned]) }),
                    candidates[candidateIndex].data.allSatisfy({ $0.metadata.isDisjoint(with: [.isFromUserDictionary]) }) {
-                    // [hazkey-community patch] Preserve explicitly registered user-dictionary candidates.
-                    // A repeated identical constraint must use the existing give-up path when it
-                    // contains a user-dictionary entry; retain this retry only for learned entries.
-                    // `ignoreMemoryAndUserDictionary`でない場合、学習候補がモデルにリジェクトされた可能性を検討する
+                    // [Hazkey Community Patch]
+                    // 明示的に登録されたユーザ辞書候補を保持する
+                    // 同じ制約の繰り返しはユーザ辞書エントリを含む場合既存の諦め経路を使い学習エントリだけがこのリトライを残す
+                    // ignoreMemoryAndUserDictionaryでない場合、学習候補がモデルにリジェクトされた可能性を検討する
                     debug("same constraint (wholeResult), but retry without memory and user dictionary:", constraint)
                     constraint.ignoreMemoryAndUserDictionary = true
                     for (i, candidate) in candidates.indexed() where i != candidateIndex {
@@ -741,8 +825,8 @@ extension Kana2Kanji {
                 return candidate.text.utf8.hasPrefix(constraint.constraint)
             }
         }
-        // [hazkey-community patch] jinen (Qwen3) は NFKC 正規化空間で出力するため、
-        // モデル出力由来の制約バイトと辞書候補表記を NFKC 正規化して比較する。
+        // [Hazkey Community Patch]
+        // jinen (Qwen3) はNFKC正規化空間で出力するため、モデル出力由来の制約バイトと辞書候補表記をNFKC正規化して比較する
         let candidateText = candidate.text.precomposedStringWithCompatibilityMapping
         let constraintText = String(decoding: constraint.constraint, as: UTF8.self)
             .precomposedStringWithCompatibilityMapping

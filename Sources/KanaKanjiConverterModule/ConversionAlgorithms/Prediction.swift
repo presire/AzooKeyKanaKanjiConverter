@@ -209,7 +209,8 @@ extension Kana2Kanji {
                 let possibleNexts: [Substring] = table.possibleNexts[String(roman), default: []].map {ruby + $0}
                 debug(#function, lastRuby, ruby, roman, possibleNexts, prepart, lastRubyCount)
                 dicdata = possibleNexts.flatMap { self.dicdataStore.getPredictionLOUDSDicdata(key: $0, state: dicdataStoreState, includeExactMatch: true) }
-                // [hazkey-community patch] 動的ユーザ辞書もシステム辞書と同じく末尾のローマ字を展開した読みで引く (「バn」→「バン」「バナ」…)
+                // [Hazkey Community Patch]
+                // 動的ユーザ辞書もシステム辞書と同じく末尾のローマ字を展開した読みで引く (「バn」→「バン」「バナ」…)
                 // 展開先が無い場合は、未展開の読みでの一致 (英字を含む読みの登録語) を残す
                 if !possibleNexts.isEmpty {
                     osuserdict = self.dicdataStore.getPrefixMatchDynamicUserDict(anyOf: possibleNexts, state: dicdataStoreState)

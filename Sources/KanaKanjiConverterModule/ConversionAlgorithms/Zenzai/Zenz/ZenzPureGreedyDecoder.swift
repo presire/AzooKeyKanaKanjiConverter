@@ -7,7 +7,8 @@ import SwiftUtils
 
 struct ZenzPureGreedyDecoder {
     static func decode(context: ZenzContext, leftSideContext: String, maxCount: Int = .max) -> String {
-        // [hazkey-community patch] opt-in Zenzai CPU latency deadline (HAZKEY_ZENZAI_DEADLINE_MS)
+        // [Hazkey Community Patch]
+        // HAZKEY_ZENZAI_DEADLINE_MS設定時のみ有効な推論期限の監視を開始する
         ZenzInferencePerf.shared.beginDeadlineWindow()
         var promptTokens = context.encodeRaw(leftSideContext, addBOS: false)
         let initialCount = promptTokens.count

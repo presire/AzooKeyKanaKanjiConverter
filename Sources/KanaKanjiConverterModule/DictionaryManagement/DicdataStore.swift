@@ -10,31 +10,60 @@ import Algorithms
 public import Foundation
 import SwiftUtils
 
-/// 読み取り専用の補助辞書の定義。
+/// 読み取り専用の補助辞書の定義
 ///
-/// `directoryURL`は`louds/`のみを持ち、`cb/`・`mm.binary`はシステム辞書のものを共有する。
-/// `louds/charID.chid`にはビルド時に用いたシステム辞書の`charID.chid`と同一内容を照合用スタンプとして置く。
-/// 一致しなければそのソースのみ無効化する。
+/// 置き場はloudsだけを持ち、連接コスト表と意味ID表はシステム辞書のものを共有する
+///
+/// 置き場のloudsにある文字ID表はビルド時に用いたシステム辞書のものと同一内容を照合用に置く
+///
+/// 一致しなければその提供元だけを無効化する
 public struct SupplementalDictionarySource: Sendable, Equatable {
-    /// キャッシュの名前空間に用いる安定ID。小文字英数字と`_`・`-`のみ。
+    /// 問い合わせ先の区別に用いる安定したID
+    ///
+    /// 小文字英数字と下線と短横線だけを使える
     public let id: String
+    /// 補助辞書の置き場
+    ///
+    /// nilの場合は辞書が無いものとして扱う
     public let directoryURL: URL?
 
+    /// 補助辞書の提供元を作る
+    ///
+    /// - Parameters:
+    ///   - id: 問い合わせ先の区別に用いる安定したID
+    ///   - directoryURL: 補助辞書の置き場
     public init(id: String, directoryURL: URL?) {
         self.id = id
         self.directoryURL = directoryURL
     }
 }
 
+/// 補助辞書の指定が正しくない場合のエラー
 public enum SupplementalDictionaryConfigurationError: Error, Equatable, Sendable {
+    /// 提供元の一覧が空の場合
     case emptySources
+    /// 同じIDが重複している場合
+    ///
+    /// 関連値は重複したID
     case duplicateID(String)
+    /// IDに使えない文字が含まれる場合
+    ///
+    /// 関連値は不正なID
     case invalidID(String)
 }
 
 public final class DicdataStore {
-    /// 補助辞書を宣言順に登録する。空・ID重複・不正IDは`SupplementalDictionaryConfigurationError`で拒否する。
-    /// 各ソースは個別に検証され、失敗したソースのみ無効化される。
+    /// 補助辞書を宣言順に登録する
+    ///
+    /// 空の一覧やIDの重複や不正なIDは構築時のエラーで拒否する
+    ///
+    /// 各提供元は個別に検証され、失敗した提供元だけが無効化される
+    ///
+    /// - Parameters:
+    ///   - dictionaryURL: システム辞書の置き場
+    ///   - supplementalDictionaries: 登録する補助辞書の提供元の一覧
+    ///   - preloadDictionary: システム辞書を先読みする場合はtrue
+    /// - Throws: 空や重複や不正IDの場合は辞書設定のエラー
     public convenience init(
         dictionaryURL: URL,
         supplementalDictionaries: [SupplementalDictionarySource],
@@ -59,8 +88,14 @@ public final class DicdataStore {
         )
     }
 
-    /// `supplementalDictionaryURL`は読み取り専用の補助辞書のディレクトリ。
-    /// ID`legacy`の単一の補助辞書ソースとして扱う。
+    /// 旧来の単一辞書の指定を1件の提供元として扱って辞書を作る
+    ///
+    /// 旧来の呼び出しはIDがlegacyの単一の提供元として扱う
+    ///
+    /// - Parameters:
+    ///   - dictionaryURL: システム辞書の置き場
+    ///   - supplementalDictionaryURL: 補助辞書の置き場、無い場合はnil
+    ///   - preloadDictionary: システム辞書を先読みする場合はtrue
     public convenience init(dictionaryURL: URL, supplementalDictionaryURL: URL? = nil, preloadDictionary: Bool = false) {
         self.init(
             dictionaryURL: dictionaryURL,
@@ -72,6 +107,12 @@ public final class DicdataStore {
         )
     }
 
+    /// 検証済みの提供元から辞書の実体を作る内部用の初期化
+    ///
+    /// - Parameters:
+    ///   - dictionaryURL: システム辞書の置き場
+    ///   - validatedSupplementalSources: 検証済みの補助辞書の提供元の一覧
+    ///   - preloadDictionary: システム辞書を先読みする場合はtrue
     private init(dictionaryURL: URL, validatedSupplementalSources: [ValidatedSupplementalSource], preloadDictionary: Bool) {
         self.dictionaryURL = dictionaryURL
         self.supplementalSources = validatedSupplementalSources
@@ -101,55 +142,107 @@ public final class DicdataStore {
 
     private let dictionaryURL: URL
 
+    /// 検証済みの補助辞書の提供元
     struct ValidatedSupplementalSource {
+        /// 問い合わせ先の区別に用いる安定したID
         let id: String
-        /// 検証を通過した場合のみ非nil。
+        /// 検証を通過した場合だけ置き場を持つ
+        ///
+        /// 検証に失敗した提供元は置き場がnilになり利用対象から外れる
         let directoryURL: URL?
 
+        /// 置き場を持つ場合にtrueを返す
         var isUsable: Bool {
             self.directoryURL != nil
         }
     }
 
-    /// 構築時に固定される。実行時のトグルは`DicdataStoreState`側のID別フラグで行い、この配列は変更しない。
+    /// 構築時に固定される提供元の一覧
+    ///
+    /// 実行時の有効無効は状態側のID別フラグで切り替え、この一覧自体は変えない
     private let supplementalSources: [ValidatedSupplementalSource]
+    /// IDから提供元の一覧位置を引く索引
     private let supplementalSourceIndexByID: [String: Int]
 
+    /// 旧来の単一辞書用の提供元が名乗るID
     static let legacySupplementalSourceID = "legacy"
 
-    /// 先頭の補助辞書ソースが利用可能かどうか。
+    /// 先頭の補助辞書が利用可能な場合にtrueを返す
+    ///
+    /// 旧来の単一辞書用の互換窓口が辞書の有無を調べるために使う
     public var hasSupplementalDictionary: Bool {
         self.supplementalSources.first?.isUsable ?? false
     }
 
-    /// 登録済みかつ検証済みであれば`true`。実行時の有効/無効には依存しない。
+    /// 指定したIDの提供元が登録済みで検証を通過している場合にtrueを返す
+    ///
+    /// 実行時の有効無効には依存しない
+    ///
+    /// - Parameter id: 補助辞書のID
+    /// - Returns: 利用可能な場合はtrue
     public func isSupplementalDictionaryAvailable(for id: String) -> Bool {
         self.supplementalSourceIndexByID[id].map { self.supplementalSources[$0].isUsable } ?? false
     }
 
+    /// IDに使える文字だけが含まれる場合にtrueを返す
+    ///
+    /// 空のIDは受け付けない
+    ///
+    /// - Parameter id: 調べるID
+    /// - Returns: 小文字英数字と下線と短横線だけの場合はtrue
     static func isValidSupplementalSourceID(_ id: String) -> Bool {
         !id.isEmpty && id.unicodeScalars.allSatisfy {
             ("a" ... "z").contains($0) || ("0" ... "9").contains($0) || $0 == "_" || $0 == "-"
         }
     }
 
+    /// 補助辞書の問い合わせ先頭に付く目印
+    ///
+    /// 補助辞書の問い合わせはsupplementalに提供元のIDと辞書内の識別子を続けた形になる
     static let supplementalQueryPrefix = "supplemental:"
 
-    /// 補助辞書のクエリ`supplemental:<id>:<identifier>`を作る。`loudses`・`loudstxts`のキャッシュキーもこの完全な形を用いる。
+    /// 補助辞書の問い合わせを作る
+    ///
+    /// 作った文字列はloudsesとloudstxtsの受け渡しの鍵にもそのまま用いる
+    ///
+    /// 同じ先頭文字でも辞書ごとにノード番号の意味が異なるため、鍵は提供元ごとに分ける
+    ///
+    /// - Parameters:
+    ///   - identifier: 辞書内の識別子 (通常は先頭1文字)
+    ///   - sourceID: 補助辞書のID
+    /// - Returns: supplementalに提供元のIDと識別子を続けた問い合わせ
     static func supplementalQuery(_ identifier: some StringProtocol, sourceID: String) -> String {
         Self.supplementalQueryPrefix + sourceID + ":" + identifier
     }
 
+    /// 旧来の単一辞書用の問い合わせを作る互換窓口
+    ///
+    /// IDがlegacyの提供元への問い合わせとして作る
+    ///
+    /// - Parameter identifier: 辞書内の識別子 (通常は先頭1文字)
+    /// - Returns: 旧来IDでの補助辞書の問い合わせ
     static func supplementalQuery(_ identifier: some StringProtocol) -> String {
         Self.supplementalQuery(identifier, sourceID: Self.legacySupplementalSourceID)
     }
 
+    /// 指定した提供元が検証済みで実行時にも有効な場合にtrueを返す
+    ///
+    /// - Parameters:
+    ///   - source: 検証済みの補助辞書の提供元
+    ///   - state: 実行時の有効無効を持つ辞書の状態
+    /// - Returns: 利用可能な場合はtrue
     private func supplementalSourceIsUsable(_ source: ValidatedSupplementalSource, state: DicdataStoreState) -> Bool {
         source.isUsable && state.isSupplementalDictionaryEnabled(source.id)
     }
 
-    /// 補助辞書のクエリを、利用可能なソースのディレクトリとソース内の識別子へ解決する。
-    /// 未知のID、検証失敗、無効化中のいずれかであれば`nil`。
+    /// 補助辞書の問い合わせを利用可能な提供元の置き場と辞書内の識別子へ解く
+    ///
+    /// 未知のIDや検証失敗や無効化中のいずれかであればnilを返す
+    ///
+    /// - Parameters:
+    ///   - query: 補助辞書の問い合わせ
+    ///   - state: 実行時の有効無効を持つ辞書の状態
+    /// - Returns: 提供元のIDと置き場と辞書内の識別子、利用できない場合はnil
     private func usableSupplementalTarget(of query: String, state: DicdataStoreState) -> (sourceID: String, directoryURL: URL, identifier: String)? {
         let body = query.dropFirst(Self.supplementalQueryPrefix.count)
         guard let separator = body.firstIndex(of: ":"),
@@ -190,8 +283,16 @@ public final class DicdataStore {
         }
     }
 
-    /// 各補助辞書の`louds/charID.chid`がシステム辞書と一致しなければ、そのソースのみ無効化する。
-    /// 不一致のまま引くと、同じノードindexが別の文字列を指すため無関係な語が出る。
+    /// 各補助辞書の文字ID表がシステム辞書と一致するか確かめる
+    ///
+    /// 一致しないまま引くと、同じノード番号が別の文字列を指すため無関係な語が出る
+    ///
+    /// 検証に落ちた提供元は置き場をnilにしてその提供元だけを無効化する
+    ///
+    /// - Parameters:
+    ///   - sources: 登録する補助辞書の提供元の一覧
+    ///   - systemDictionaryURL: システム辞書の置き場
+    /// - Returns: 検証済みの補助辞書の提供元の一覧
     private static func validateSupplementalSources(
         _ sources: [SupplementalDictionarySource],
         systemDictionaryURL: URL
@@ -251,6 +352,9 @@ public final class DicdataStore {
         }
     }
 
+    /// 登録した補助辞書のID一覧を持った辞書の状態を作る
+    ///
+    /// - Returns: 辞書引きに渡す辞書の状態
     package func prepareState() -> DicdataStoreState {
         .init(dictionaryURL: self.dictionaryURL, supplementalSourceIDs: self.supplementalSources.map(\.id))
     }
@@ -563,6 +667,13 @@ public final class DicdataStore {
                         dynamicDicdata[depth, default: []].append(data.adjustedData(adjust))
                     }
                 }
+                // [Hazkey Community Patch]
+                // 動的ユーザ辞書の読みへ続く経路を到達可能として扱い、LOUDSに無い長い読みの語を探索の打ち切りで落とさない
+                // 読みの途中がどのLOUDSにも無い語 (例: マトウゾウケン) は、短い読みから探索すると到達不能の通知で長い読みが生成されなくなっていた
+                if availableMaxIndex < characters.endIndex - 1 {
+                    let matchedCount = self.longestDynamicUserDictPrefixMatchCount(characters, state: state)
+                    availableMaxIndex = max(availableMaxIndex, matchedCount - 1)
+                }
             }
             if availableMaxIndex < characters.endIndex - 1 {
                 // 到達不可能だったパスを通知
@@ -626,7 +737,9 @@ public final class DicdataStore {
             let escaped = DictionaryBuilder.escapedIdentifier(target.identifier)
             for (key, value) in dict {
                 let fileID = "\(escaped)\(key)"
-                // キャッシュキーはシステム辞書・他の補助辞書と衝突させない。同じ先頭文字でも辞書ごとにノードindexの意味が異なる。
+                // 受け渡しの鍵は提供元ごとに分け、システム辞書や他の補助辞書と衝突させない
+                //
+                // 同じ先頭文字でも辞書ごとにノード番号の意味が異なる
                 data.append(contentsOf: LOUDS.getDataForLoudstxt3(
                     fileID,
                     indices: value.map { $0 & DictionaryBuilder.localMask },
@@ -1119,12 +1232,47 @@ public final class DicdataStore {
         state.dynamicUserDictionary.filter {$0.ruby == ruby}
     }
 
+    // [Hazkey Community Patch]
+    /// 動的ユーザ辞書のいずれかの読みと先頭から一致する最長の文字数を返す
+    ///
+    /// 辞書探索の打ち切り判定で、動的ユーザ辞書の語へ続く経路を到達可能として扱うために使う
+    ///
+    /// - Parameters:
+    ///   - characters: 探索中の読み。ひらがなはカタカナとして比較する
+    ///   - state: 辞書の状態
+    /// - Returns: 一致した文字数。一致する読みが無い場合は0
+    func longestDynamicUserDictPrefixMatchCount(_ characters: [Character], state: DicdataStoreState) -> Int {
+        let katakana = characters.map { $0.toKatakana() }
+        var longest = 0
+        for element in state.dynamicUserDictionary {
+            var matched = 0
+            for (rubyCharacter, character) in zip(element.ruby, katakana) {
+                guard rubyCharacter == character else {
+                    break
+                }
+                matched += 1
+            }
+            longest = max(longest, matched)
+            if longest == katakana.count {
+                break
+            }
+        }
+        return longest
+    }
+
     /// 動的ユーザ辞書からrubyに先頭一致する語を返す。
     func getPrefixMatchDynamicUserDict(_ ruby: some StringProtocol, state: DicdataStoreState) -> [DicdataElement] {
         state.dynamicUserDictionary.filter {$0.ruby.hasPrefix(ruby)}
     }
 
-    /// 動的ユーザ辞書から、rubiesのいずれかに先頭一致する語を返す。複数のrubyに一致する語も1回だけ返す。
+    /// 動的ユーザ辞書から複数の読みのいずれかに先頭一致する語を返す
+    ///
+    /// 複数の読みに一致する語も1回だけ返す
+    ///
+    /// - Parameters:
+    ///   - rubies: 先頭一致で探す読みの一覧
+    ///   - state: 辞書の状態
+    /// - Returns: 先頭一致した動的ユーザ辞書の語の一覧
     func getPrefixMatchDynamicUserDict(anyOf rubies: [some StringProtocol], state: DicdataStoreState) -> [DicdataElement] {
         state.dynamicUserDictionary.filter { data in
             rubies.contains { data.ruby.hasPrefix($0) }

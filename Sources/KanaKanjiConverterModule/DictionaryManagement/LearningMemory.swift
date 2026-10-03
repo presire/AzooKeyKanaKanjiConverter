@@ -106,6 +106,15 @@ struct LongTermLearningMemory {
             return data
         }
 
+        /// メタデータ全体をノードごとの並びとして厳密に読み出す
+        ///
+        /// 件数や長さが範囲外の入力は確保の前に棄却して列挙時のエラーを投げる
+        ///
+        /// 巨大な宣言件数でのメモリ確保による落ちを防ぐための検査である
+        ///
+        /// - Parameter data: メタデータファイル全体のバイナリ
+        /// - Returns: ノードごとのメタデータの並び
+        /// - Throws: 壊れた内容の場合はLearningMemoryEnumerationErrorのmalformedMetadata
         static func readAll(from data: Data) throws -> [MetadataBlock] {
             let nodeCountSize = MemoryLayout<UInt32>.size
             guard data.count >= nodeCountSize else {
@@ -116,7 +125,9 @@ struct LongTermLearningMemory {
                 buffer.loadUnaligned(fromByteOffset: 0, as: UInt32.self)
             }
             var offset = nodeCountSize
-            // 各ノードは少なくとも件数の1バイトを持つ。残りのバイト数を超えるノード数は壊れており、確保の前に棄却する
+            // 各ノードは少なくとも件数の1バイトを持つ
+            //
+            // 残りのバイト数を超えるノード数は壊れているため、確保の前に棄却する
             guard Int(nodeCount) <= data.count - offset else {
                 throw LearningMemoryEnumerationError.malformedMetadata
             }
@@ -230,11 +241,21 @@ struct LongTermLearningMemory {
         }
     }
 
-    /// 永続化済み学習メモリから、指定した読みに完全一致する行のキーを取得する。
+    /// 永続化済み学習メモリから指定した読みに完全一致する行のキーを取得する
     ///
-    /// 変換経路がキャッシュしている memory LOUDS で各読みをノードインデックスへ解決し、
-    /// シャード別にまとめることで `memoryN.loudstxt3` を1呼び出しにつき高々1回しか読まない。
-    /// 一時記憶 (`TemporalLearningMemoryTrie`) は参照しない。
+    /// 変換経路が持つmemoryのLOUDSで各読みをノード番号へ解決する
+    ///
+    /// 番号をシャード別にまとめることで、シャードの読み出しを1回の呼び出しで高々1回に抑える
+    ///
+    /// 一時記憶は参照しない
+    ///
+    /// - Parameters:
+    ///   - directoryURL: 学習データの置き場
+    ///   - louds: 変換経路が持つmemoryのLOUDS
+    ///   - char2UInt8: 文字から文字IDへの対応表
+    ///   - exactReadings: 完全一致で探す読みの一覧
+    /// - Returns: 読みと表記と品詞IDのキーの一覧
+    /// - Throws: 停止中や壊れたシャードの場合は列挙時のエラー
     static func persistedLearningMemoryKeys(
         directoryURL: URL,
         louds: LOUDS,
@@ -246,7 +267,7 @@ struct LongTermLearningMemory {
         }
         var nodeIndices: Set<Int> = []
         for reading in exactReadings where !reading.isEmpty {
-            // 未知文字を含む読みは trie に存在し得ないので、シャードI/Oなしで棄却する
+            // 未知文字を含む読みは木に存在し得ないため、シャードの読み出しなしで棄却する
             guard let chars = LearningManager.keyToChars(reading, char2UInt8: char2UInt8),
                   let nodeIndex = louds.searchNodeIndex(chars: chars) else {
                 continue
@@ -279,6 +300,16 @@ struct LongTermLearningMemory {
         return keys
     }
 
+    /// 永続化済み学習メモリを指定範囲だけ列挙する
+    ///
+    /// 末尾まで走査して件数の整合性を確認する
+    ///
+    /// - Parameters:
+    ///   - directoryURL: 学習データの置き場
+    ///   - offset: 先頭から数えた開始位置
+    ///   - limit: 取得する上限件数
+    /// - Returns: 指定範囲のエントリと総件数と次の開始位置
+    /// - Throws: 壊れた内容の場合は列挙時のエラー
     static func learningMemoryEntries(
         directoryURL: URL,
         offset: Int,
@@ -292,12 +323,17 @@ struct LongTermLearningMemory {
         )
     }
 
-    /// 永続化済み学習メモリを1回の走査でまとめて取得する。
+    /// 永続化済み学習メモリを先頭から上限まで1回の走査で取得する
     ///
-    /// ページ版は `rowIndex == totalCount` を整合性チェックに使うため常に末尾まで走査し、
-    /// 全件取得がページ数に比例して O(N^2) になる。こちらは上限をそのまま `limit` として受け取り、
-    /// 満たした時点で走査を打ち切る。末尾まで到達した場合は整合性チェックを維持し、
-    /// 打ち切った場合はメタデータ上の `totalCount` を報告する。
+    /// 末尾まで走査した場合は整合性を確認する
+    ///
+    /// 上限で打ち切った場合は件数だけを報告する
+    ///
+    /// - Parameters:
+    ///   - directoryURL: 学習データの置き場
+    ///   - limit: 取得する上限件数
+    /// - Returns: 先頭からのエントリと総件数と次の開始位置
+    /// - Throws: 壊れた内容の場合は列挙時のエラー
     static func learningMemoryEntriesSinglePass(
         directoryURL: URL,
         limit: Int
@@ -310,6 +346,19 @@ struct LongTermLearningMemory {
         )
     }
 
+    /// 永続化済み学習メモリの走査の実体
+    ///
+    /// ページ取得では上限に達しても末尾まで走査して件数の整合性を確認する
+    ///
+    /// 単回取得では上限に達した時点で走査を打ち切り、件数だけを報告する
+    ///
+    /// - Parameters:
+    ///   - directoryURL: 学習データの置き場
+    ///   - offset: 先頭から数えた開始位置
+    ///   - limit: 取得する上限件数
+    ///   - stoppingWhenPageIsFull: 上限で打ち切る場合はtrue
+    /// - Returns: 指定範囲のエントリと総件数と次の開始位置
+    /// - Throws: 壊れた内容の場合は列挙時のエラー
     private static func scanLearningMemoryEntries(
         directoryURL: URL,
         offset: Int,
@@ -414,6 +463,17 @@ struct LongTermLearningMemory {
         )
     }
 
+    /// 一時記憶と長期記憶を統合し、指定したキーに一致する学習だけを正確に削除する
+    ///
+    /// 表記だけが一致する別品詞の語は削除しない
+    ///
+    /// - Parameters:
+    ///   - tempTrie: 統合する一時記憶
+    ///   - target: 削除対象の読みと表記と品詞ID
+    ///   - directoryURL: 学習データの置き場
+    ///   - maxMemoryCount: 保持する上限件数
+    ///   - char2UInt8: 文字から文字IDへの対応表
+    /// - Throws: 書き込みに失敗した場合はファイル操作のエラー
     static func mergeExactlyForgetting(tempTrie: consuming TemporalLearningMemoryTrie, target: LearningMemoryKey, directoryURL: URL, maxMemoryCount: Int, char2UInt8: [Character: UInt8]) throws {
         try merge(
             tempTrie: tempTrie,
@@ -424,10 +484,17 @@ struct LongTermLearningMemory {
         )
     }
 
+    /// 統合時に取り除く学習データの選び方
     private enum ForgetPolicy {
+        /// 表記が一致する語を全て取り除く選び方
         case words(Set<String>)
+        /// 読みと表記と品詞IDが一致するものだけを取り除く選び方
         case exact(LearningMemoryKey)
 
+        /// 指定した語が取り除き対象の場合にtrueを返す
+        ///
+        /// - Parameter element: 調べる語
+        /// - Returns: 対象の場合はtrue
         func matches(_ element: DicdataElement) -> Bool {
             switch self {
             case .words(let words):
@@ -459,24 +526,28 @@ struct LongTermLearningMemory {
         // 構造:
         // dataCount(UInt32), count, data*count, count, data*count, ...
         // MARK: 読み出しは、`metadataFile`が存在しなかった場合（学習が一切ない場合）に失敗する。
-        // 先頭4byteの件数すら読めないメタデータも、学習が一切ない場合と同じに扱う。
+        // 先頭4バイトの件数すら読めないメタデータも学習が一切ない場合と同じに扱う
         let storedMetadata = (try? Data(contentsOf: metadataFileURL(asTemporaryFile: false, directoryURL: directoryURL))) ?? Data()
         let ltMetadata = storedMetadata.count >= 4 ? storedMetadata : Data([.zero, .zero, .zero, .zero])
         var metadataOffset = ltMetadata.startIndex
         // 最初の4byteはentry countに対応する
         let declaredEntryCount = Int(ltMetadata[metadataOffset ..< metadataOffset + 4].toArray(of: UInt32.self)[0])
-        // 各ノードは少なくとも1byteを持つため、残りのバイト数を超える件数は壊れている。走査するシャードの数を抑えるために丸める。
+        // 各ノードは少なくとも1バイトを持つため、残りのバイト数を超える件数は壊れている
+        //
+        // 走査するシャードの数を抑えるために丸める
         let entryCount = min(declaredEntryCount, ltMetadata.count - 4)
         metadataOffset += 4
 
         debug("LongTermLearningMemory merge entryCount", entryCount, ltMetadata.count)
 
-        // 1ノード分のメタデータを読む。範囲外の場合はnilを返し、以降のメタデータとの対応は取れないものとする。
+        // 1ノード分のメタデータを読む
+        //
+        // 範囲外の場合はnilを返し、以降のメタデータとの対応は取れないものとする
         func readMetadataBlock() -> [MetadataElement]? {
             guard metadataOffset < ltMetadata.endIndex else {
                 return nil
             }
-            // 1byteで項目数
+            // 1バイトで項目数を読む
             let itemCount = Int(ltMetadata[metadataOffset])
             let byteCount = itemCount * MemoryLayout<MetadataElement>.size
             guard byteCount <= ltMetadata.endIndex - (metadataOffset + 1) else {
@@ -491,7 +562,9 @@ struct LongTermLearningMemory {
             return metadata
         }
 
-        // loudstxt3の索引を読む。件数・索引が範囲外の場合はnilを返す。
+        // シャード内の索引を読む
+        //
+        // 件数や索引が範囲外の場合はnilを返す
         func readShardIndices(_ loudstxtData: Data) -> [UInt32]? {
             guard loudstxtData.count >= 2 else {
                 return nil
@@ -503,10 +576,15 @@ struct LongTermLearningMemory {
             return loudstxtData[loudstxtData.startIndex + 2 ..< loudstxtData.startIndex + 2 + 4 * count].toArray(of: UInt32.self)
         }
 
-        // それぞれのloudstxt3ファイルに対して処理を行う
-        // 読めない・壊れたシャードは飛ばし、そのシャードが持つはずのノード数だけメタデータを読み捨てて、後続のシャードとの対応を保つ。
-        // `update(trie:directoryURL:)`は各シャードへちょうど`txtFileSplit`ノードずつ (最後のシャードは残り全部) 書くため、件数がこれと異なるシャードも壊れている。
-        // 壊れたメタデータ以降は対応が取れないため、そこで長期記憶の読み込みを打ち切る。
+        // それぞれのシャードに対して処理を行う
+        //
+        // 読めない壊れたシャードは飛ばし、そのシャードが持つはずのノード数だけメタデータを読み捨てる
+        //
+        // 後続のシャードとの対応を保つためである
+        //
+        // 書き出しは各シャードへ決まったノード数ずつ行うため、件数が異なるシャードも壊れている
+        //
+        // 壊れたメタデータ以降は対応が取れないため、そこで長期記憶の読み込みを打ち切る
         shardLoop: for loudstxtIndex in 0 ..< entryCount / txtFileSplit + 1 {
             let expectedNodeCount = max(0, min(txtFileSplit, declaredEntryCount - loudstxtIndex * txtFileSplit))
             guard let loudstxtData = try? Data(contentsOf: loudsTxt3FileURL("\(loudstxtIndex)", asTemporaryFile: false, directoryURL: directoryURL)),
@@ -607,10 +685,17 @@ struct LongTermLearningMemory {
     enum UpdateError: Error {
         /// `.pause`が存在するため更新を停止する場合
         case pauseFileExist
-        /// `.pause`を書き出した後に失敗した場合
+        /// 停止標識を書き出した後に失敗した場合
         ///
-        /// `.2`のファイルにはこの更新の内容が揃っており、次回の`merge`が元のファイルの位置へ復元する。
-        /// 呼び出し側は同じ一時記憶を再びマージしてはいけない (学習の回数が二重に加算される)。
+        /// 末尾に2を付けたファイルにはこの更新の内容が揃っている
+        ///
+        /// 次回の統合が元のファイルの位置へ復元する
+        ///
+        /// 呼び出し側は同じ一時記憶を再び統合してはいけない
+        ///
+        /// 回数が二重に数えられるためである
+        ///
+        /// 関連値は失敗の原因となったエラー
         case interruptedAfterPause(any Error)
     }
 
@@ -691,21 +776,23 @@ struct LongTermLearningMemory {
         }
 
         do {
-            // MARK: `.pause`ファイルを書き出す
+            // MARK: 停止標識ファイルを書き出す
             try Data().write(to: pauseFileURL(directoryURL: directoryURL))
 
-            // MARK: 各`.2`のファイルで元のファイルを上書きする
+            // MARK: 末尾に2を付けたファイルで元のファイルを上書きする
             try overwriteTempFiles(
                 directoryURL: directoryURL,
                 loudsFileTemp: loudsFileTemp,
                 loudsCharsFileTemp: loudsCharsFileTemp,
                 metadataFileTemp: metadataFileTemp,
                 loudsTxt3FileCount: loudsTxt3FileCount,
-                // MARK: 成功の場合、`.pause`ファイルも削除する
+                // MARK: 成功の場合、停止標識ファイルも削除する
                 removingRead2File: true
             )
         } catch {
-            // 冒頭で`.pause`が無いことを確認しているため、ここで残っている`.pause`はこの更新が書き出したものである
+            // 冒頭で停止標識が無いことを確認している
+            //
+            // ここで残っている停止標識はこの更新が書き出したものである
             if fileExist(pauseFileURL(directoryURL: directoryURL)) {
                 throw UpdateError.interruptedAfterPause(error)
             }
@@ -861,6 +948,14 @@ struct TemporalLearningMemoryTrie {
         return true
     }
 
+    /// 一時記憶から指定したキーに一致する学習だけを正確に取り除く
+    ///
+    /// 表記だけが一致する別品詞の語は残る
+    ///
+    /// - Parameters:
+    ///   - target: 削除対象の読みと表記と品詞ID
+    ///   - chars: 読みの文字ID列
+    /// - Returns: 木をたどれた場合はtrue、存在しない読みの場合はfalse
     @discardableResult
     mutating func forget(exactly target: LearningMemoryKey, chars: [UInt8]) -> Bool {
         var index = 0
@@ -947,6 +1042,12 @@ public struct LearningConfig: Sendable, Equatable {
     var maxMemoryCount: Int = 0
     var memoryURL: URL?
 
+    /// 学習の設定を作る
+    ///
+    /// - Parameters:
+    ///   - learningType: 学習の種類
+    ///   - maxMemoryCount: 保持する上限件数
+    ///   - memoryURL: 学習データの置き場
     public init(learningType: LearningType = .nothing, maxMemoryCount: Int = 0, memoryURL: URL? = nil) {
         self.learningType = learningType
         self.maxMemoryCount = maxMemoryCount
@@ -997,16 +1098,23 @@ final class LearningManager {
         Self.updateChar2Int8(bundleURL: dictionaryURL, target: &self.char2UInt8)
     }
 
-    /// 学習に実際に使われる memory ディレクトリ。学習が無効なら参照されないので `nil` 扱いにする。
+    /// 学習に実際に使うmemoryの置き場を求める
+    ///
+    /// 学習が無効なら参照されないためnilとして扱う
+    ///
+    /// - Parameter config: 学習の設定
+    /// - Returns: 使う置き場、学習が無効な場合はnil
     private static func effectiveMemoryURL(of config: LearningConfig) -> URL? {
         config.learningType.needUsingMemory ? config.memoryURL : nil
     }
 
     /// - Returns: Whether cache should be reseted or not.
     func updateConfig(_ newConfig: LearningConfig) -> Bool {
-        // memory LOUDS キャッシュは memory ディレクトリに紐づく。ディレクトリが変わったら必ず
-        // リセットを要求しないと、`DicdataStoreState.memoryURL` だけが新ディレクトリに切り替わり、
-        // 旧ディレクトリで構築された trie の node index で新ディレクトリのシャードを読むことになる。
+        // memoryのLOUDS受け渡しはmemoryの置き場に結び付く
+        //
+        // 置き場が変わったら受け渡しの破棄を要求しないと不整合が起きる
+        //
+        // 状態側の置き場だけが新しい置き場に切り替わり、古い置き場で作った木の番号で新しい置き場の断片を読むことになる
         let memoryURLChanged = Self.effectiveMemoryURL(of: self.config) != Self.effectiveMemoryURL(of: newConfig)
         // 更新の必要がなければ何もしない
         if !newConfig.learningType.needUsingMemory {
@@ -1208,7 +1316,9 @@ final class LearningManager {
             // マージが済んだので、temporaryMemoryを空にする
             self.temporaryMemory = TemporalLearningMemoryTrie()
         } catch LongTermLearningMemory.UpdateError.interruptedAfterPause(let error) {
-            // temporaryMemoryの内容は`.2`のファイルに含まれ、次回の`merge`で復元されるため、二重に学習しないよう空にする
+            // 一時記憶の内容は末尾に2を付けたファイルに含まれ、次回の統合で復元される
+            //
+            // 二重に学習しないよう空にする
             self.temporaryMemory = TemporalLearningMemoryTrie()
             debug("LearningManager resetLearning: Failed to save LongTermLearningMemory", error)
         } catch {
@@ -1219,6 +1329,14 @@ final class LearningManager {
         self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
     }
 
+    /// 一時記憶と永続化済みの双方から指定したキーに一致する学習だけを正確に削除する
+    ///
+    /// 永続化の統合は表記一致の古い取り除き方を使わず、読みと表記と品詞IDの一致で行う
+    ///
+    /// 成功と失敗のいずれでも破壊状態の判定を更新する
+    ///
+    /// - Parameter target: 削除対象の読みと表記と品詞ID
+    /// - Throws: 学習データの置き場が無い場合や書き込みに失敗した場合は列挙時やファイル操作のエラー
     func forgetLearningMemory(exactly target: LearningMemoryKey) throws {
         guard self.config.learningType.needUpdateMemory else {
             return
@@ -1229,7 +1347,7 @@ final class LearningManager {
         if let chars = Self.keyToChars(target.reading, char2UInt8: char2UInt8) {
             self.temporaryMemory.forget(exactly: target, chars: chars)
         }
-        // save()と同じく、成功・失敗のいずれでも破壊状態の判定を更新する
+        // 保存処理と同じく、成功と失敗のいずれでも破壊状態の判定を更新する
         defer {
             self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
         }
@@ -1242,13 +1360,24 @@ final class LearningManager {
                 char2UInt8: char2UInt8
             )
         } catch LongTermLearningMemory.UpdateError.interruptedAfterPause(let error) {
-            // temporaryMemoryの内容は`.2`のファイルに含まれ、次回の`merge`で復元されるため、二重に学習しないよう空にする
+            // 一時記憶の内容は末尾に2を付けたファイルに含まれ、次回の統合で復元される
+            //
+            // 二重に学習しないよう空にする
             self.temporaryMemory = TemporalLearningMemoryTrie()
             throw error
         }
         self.temporaryMemory = TemporalLearningMemoryTrie()
     }
 
+    /// 永続化済み学習メモリを指定範囲だけ列挙する
+    ///
+    /// 末尾まで走査して件数の整合性を確認する
+    ///
+    /// - Parameters:
+    ///   - offset: 先頭から数えた開始位置
+    ///   - limit: 取得する上限件数
+    /// - Returns: 指定範囲のエントリと総件数と次の開始位置
+    /// - Throws: 学習データの置き場が無い場合や壊れた内容の場合は列挙時のエラー
     func learningMemoryEntries(offset: Int, limit: Int) throws -> LearningMemoryPage {
         guard let memoryURL = config.memoryURL else {
             throw LearningMemoryEnumerationError.memoryDirectoryUnavailable
@@ -1260,6 +1389,13 @@ final class LearningManager {
         )
     }
 
+    /// 永続化済み学習メモリを先頭から上限まで1回の走査で取得する
+    ///
+    /// 学習履歴の選択削除ダイアログが全件取得に使う入口である
+    ///
+    /// - Parameter limit: 取得する上限件数
+    /// - Returns: 先頭からのエントリと総件数と次の開始位置
+    /// - Throws: 学習データの置き場が無い場合や壊れた内容の場合は列挙時のエラー
     func learningMemoryEntriesSinglePass(limit: Int) throws -> LearningMemoryPage {
         guard let memoryURL = config.memoryURL else {
             throw LearningMemoryEnumerationError.memoryDirectoryUnavailable
@@ -1270,6 +1406,20 @@ final class LearningManager {
         )
     }
 
+    /// 未保存の一時記憶を永続化する
+    ///
+    /// 失敗時は一時記憶を保持したままエラーを投げ直すため、呼び出し側は再試行できる
+    ///
+    /// 停止標識を書き出した後の失敗だけは例外である
+    ///
+    /// 内容が末尾に2を付けたファイルに揃い次回の統合で復元されるため、空にしてから投げ直す
+    ///
+    /// 停止標識が残っている場合は未保存が空でも統合して復元を試みる
+    ///
+    /// 成功と失敗のいずれでも破壊状態の判定を更新する
+    ///
+    /// - Returns: 保存が起きた場合はtrue、何もしない場合はfalse
+    /// - Throws: 書き込みに失敗した場合はファイル操作のエラー
     @discardableResult
     func save() throws -> Bool {
         guard self.config.learningType.needUpdateMemory,
@@ -1277,18 +1427,26 @@ final class LearningManager {
             debug(#function, "config.learningType=\(self.config.learningType as _?)", "skip memory update")
             return false
         }
-        // `.pause`が残っている場合は、pending が空でも`.2`のファイルを復元するためにマージする
+        // 停止標識が残っている場合は未保存が空でも統合して復元する
         guard !self.temporaryMemory.isEmpty || LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL) else {
             debug(#function, "skip because there is no pending memory")
             return false
         }
-        // 成功・失敗のいずれでも破壊状態の判定を更新する。失敗時は pending の一時記憶を保持したまま再送出する。
+        // 成功と失敗のいずれでも破壊状態の判定を更新する
+        //
+        // 失敗時は未保存の一時記憶を保持したまま投げ直す
         defer {
             self.memoryCollapsed = LongTermLearningMemory.memoryCollapsed(directoryURL: memoryURL)
         }
-        // マージが済んだ場合のみ temporaryMemory を空にする。失敗時は保持して再送出する。
-        // ただし`.pause`を書き出した後の失敗では、pending は`.2`のファイルに含まれ次回の`merge`で復元されるため、
-        // 保持すると再送出後の再試行で二重に学習される。この場合は空にしてから再送出する。
+        // 統合が済んだ場合だけ一時記憶を空にする
+        //
+        // 失敗時は保持して投げ直す
+        //
+        // 停止標識を書き出した後の失敗だけは例外である
+        //
+        // 未保存の内容は末尾に2を付けたファイルに含まれ次回の統合で復元される
+        //
+        // 保持すると投げ直し後の再試行で二重に学習されるため、この場合は空にしてから投げ直す
         do {
             try LongTermLearningMemory.merge(tempTrie: self.temporaryMemory, directoryURL: memoryURL, maxMemoryCount: self.config.maxMemoryCount, char2UInt8: char2UInt8)
         } catch LongTermLearningMemory.UpdateError.interruptedAfterPause(let error) {

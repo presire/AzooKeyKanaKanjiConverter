@@ -8,12 +8,13 @@ import SwiftUtils
 /// ことを避ける。context内のKV再利用は毎回完全なtoken prefixを照合するため、
 /// セッションを跨いでも推論結果には影響しない。
 ///
-/// キャッシュキーは`resourceURL`と`deviceConfig`の両方から構成する。URLのみをキーにすると、
-/// 同じモデルを異なるデバイス構成 (例: CPU→GPU切り替え) で要求した際に、先にロードされた
-/// デバイス構成の`Zenz`（＝その`ZenzContext`）が誤って再利用されてしまう。
+/// キャッシュキーはresourceURLとdeviceConfigの両方から構成する
+///
+/// URLだけをキーにすると同じモデルを異なるデバイス構成で要求した際に先に読み込まれた構成のZenzが誤って再利用されてしまう
 ///
 /// アクセスレベルはテスト容易性のためfileprivateからinternalへ緩和している
-/// (publicではない = モジュール外からは引き続き不可視)。
+///
+/// (publicではないためモジュール外からは引き続き不可視)
 final class SharedZenzCache: @unchecked Sendable {
     static let shared = SharedZenzCache()
 
@@ -21,6 +22,15 @@ final class SharedZenzCache: @unchecked Sendable {
         self.cache.countLimit = 1
     }
 
+    /// 要求されたモデルURLとデバイス構成に対応するZenzを返す
+    ///
+    /// キャッシュにあれば再利用し、なければ新規構築して保持する
+    ///
+    /// - Parameters:
+    ///   - resourceURL: モデルファイルの位置
+    ///   - deviceConfig: GGMLバックエンドデバイスの構成
+    /// - Returns: 要求に対応するZenz
+    /// - Throws: モデルやコンテキストの読み込みに失敗した場合
     func zenz(resourceURL: URL, deviceConfig: ZenzaiDeviceConfig) throws -> Zenz {
         try self.lock.withLock {
             let key = Self.cacheKey(resourceURL: resourceURL, deviceConfig: deviceConfig) as NSString
@@ -33,6 +43,14 @@ final class SharedZenzCache: @unchecked Sendable {
         }
     }
 
+    /// モデルURLとデバイス構成からキャッシュキーを作る
+    ///
+    /// 同じモデルでもデバイス構成が違えば別のZenzを保持するために両方をキーに含める
+    ///
+    /// - Parameters:
+    ///   - resourceURL: モデルファイルの位置
+    ///   - deviceConfig: GGMLバックエンドデバイスの構成
+    /// - Returns: URLとデバイス名とGPU層数を連結したキー
     static func cacheKey(resourceURL: URL, deviceConfig: ZenzaiDeviceConfig) -> String {
         "\(resourceURL.absoluteString)#\(deviceConfig.deviceName ?? "")#\(deviceConfig.gpuLayers)"
     }
@@ -43,24 +61,46 @@ final class SharedZenzCache: @unchecked Sendable {
 
 package final class Zenz {
     package var resourceURL: URL
-    /// このZenzインスタンスが構築された際のGGMLバックエンドデバイス構成。
-    /// 同一URLでも異なる構成が要求された場合はキャッシュを再利用してはならない
-    /// (`KanaKanjiConverter.getModel`のインスタンスキャッシュ判定 `Zenz.canReuse` 参照)。
+    /// このZenzを構築したときのGGMLバックエンドデバイス構成
+    ///
+    /// 同一URLでも異なる構成の要求には再利用してはならない
+    ///
+    /// - Note: 再利用可否の判定はZenz.canReuseが行う
     package let deviceConfig: ZenzaiDeviceConfig
     private var zenzContext: ZenzContext?
     private let inferenceLock = NSLock()
 
+    /// 要求されたモデルURLとデバイス構成に対応する共有Zenzを返す
+    ///
+    /// - Parameters:
+    ///   - resourceURL: モデルファイルの位置
+    ///   - deviceConfig: GGMLバックエンドデバイスの構成 (省略時はCPU構成)
+    /// - Returns: 要求に対応する共有Zenz
+    /// - Throws: モデルやコンテキストの読み込みに失敗した場合
     package static func shared(resourceURL: URL, deviceConfig: ZenzaiDeviceConfig = ZenzaiDeviceConfig()) throws -> Zenz {
         try SharedZenzCache.shared.zenz(resourceURL: resourceURL, deviceConfig: deviceConfig)
     }
 
-    /// キャッシュされた`Zenz`を、指定されたURL・デバイス構成の要求に対して再利用してよいかを判定する。
-    /// `KanaKanjiConverter.getModel`のインスタンスレベルキャッシュ判定から抽出した純粋な述語で、
-    /// 実llama.cppコンテキストを構築せずにデバイス構成分離のリグレッションテストが行える。
+    /// キャッシュ済みのZenzを要求に対して再利用してよいか判定する
+    ///
+    /// KanaKanjiConverter.getModelのキャッシュ判定から抽出した純粋な述語であり、実llama.cppコンテキストを構築せずにデバイス構成分離をテストできる
+    ///
+    /// - Parameters:
+    ///   - cachedURL: キャッシュ済みモデルのURL
+    ///   - cachedDeviceConfig: キャッシュ済みモデルのデバイス構成
+    ///   - requestedURL: 要求されたモデルのURL
+    ///   - requestedDeviceConfig: 要求されたデバイス構成
+    /// - Returns: URLとデバイス構成が両方一致すればtrue
     package static func canReuse(cachedURL: URL, cachedDeviceConfig: ZenzaiDeviceConfig, requestedURL: URL, requestedDeviceConfig: ZenzaiDeviceConfig) -> Bool {
         cachedURL == requestedURL && cachedDeviceConfig == requestedDeviceConfig
     }
 
+    /// 指定されたモデルとデバイス構成でZenzを構築する
+    ///
+    /// - Parameters:
+    ///   - resourceURL: モデルファイルの位置
+    ///   - deviceConfig: GGMLバックエンドデバイスの構成 (省略時はCPU構成)
+    /// - Throws: モデルやコンテキストの読み込みに失敗した場合
     init(resourceURL: URL, deviceConfig: ZenzaiDeviceConfig = ZenzaiDeviceConfig()) throws {
         self.resourceURL = resourceURL
         self.deviceConfig = deviceConfig
@@ -82,8 +122,11 @@ package final class Zenz {
         }
     }
 
-    /// [hazkey-community patch] ロード中モデルが jinen (Qwen3) 系かどうか。
-    /// `Kana2Kanji.all_zenzai` が辞書表記との制約比較を NFKC 正規化して行うために参照する。
+    /// 読み込み中のモデルがjinen (Qwen3) 系かどうか
+    ///
+    /// Kana2Kanji.all_zenzaiが辞書表記との制約比較をNFKC正規化で行うために参照する
+    ///
+    /// - Note: [Hazkey Community Patch]
     package var isJinenModel: Bool {
         self.zenzContext?.isJinenModel ?? false
     }

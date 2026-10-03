@@ -1,29 +1,32 @@
 @testable import KanaKanjiConverterModule
 import XCTest
 
-/// Regression coverage for GPU device-config propagation through the Zenzai model construction
-/// chain:
+/// GPU装置設定がZenzaiモデル構築連鎖へ伝わることの回帰テストをまとめる
 ///
-///   `KanaKanjiConverter.getModel` -> `Zenz.shared` -> `Zenz.init` -> `ZenzContext.createContext`
-///   -> `SharedZenzModelCache.model` -> `SharedZenzModelCache.modelConstructor` (test seam)
+/// KanaKanjiConverterのgetModelからZenzの共有保持を経てモデル構築の差し替え口までの経路を検証する
 ///
-/// The real llama.cpp model constructor (`SharedZenzModel.init`) is swapped out via
-/// `SharedZenzModelCache.modelConstructor` so these tests never touch llama.cpp, a real model
-/// file, GPU hardware, the live hazkey-server process, or user config. The fake constructor
-/// always throws before a `SharedZenzModel` would be constructed, so the call is fully
-/// observable without needing to fabricate llama.cpp pointers.
+/// 実際のllama.cppのモデル構築器であるSharedZenzModelのinitを差し替えるため、llama.cppや実モデルや実GPUには触れない
+///
+/// 偽構築器はSharedZenzModelの生成前に必ず失敗させ、呼び出しだけを完全に観測する
+///
+/// - Note: 装置設定APIは7ka-hiira/AzooKeyKanaKanjiConverterのcommit 8b4befcから移植した
 final class ZenzDeviceConfigPropagationTests: XCTestCase {
+    /// 構築の差し替え口へ到達したことを観測するための送出用エラー
+    ///
+    /// わざと失敗させてSharedZenzModelの生成を防ぐ
     private struct SentinelConstructionError: Error {}
 
+    /// 偽構築器を製品の初期化子へ戻す
+    ///
+    /// 他のテストへ差し替えが漏れないようにする
     override func tearDown() {
         SharedZenzModelCache.modelConstructor = SharedZenzModel.init
         super.tearDown()
     }
 
-    /// Proves that an explicit GPU `ZenzaiDeviceConfig(deviceName: "Vulkan0", gpuLayers: 99)`
-    /// supplied through `ConvertRequestOptions.ZenzaiMode.on(deviceConfig:)` reaches the model
-    /// construction seam unchanged, via the exact same `zenzaiMode.weightURL` /
-    /// `zenzaiMode.deviceConfig` accessors used by `KanaKanjiConverter`'s real call sites.
+    /// 明示のGPU設定が構築の差し替え口まで不変で届くことを検証する
+    ///
+    /// ConvertRequestOptionsのZenzaiModeに載せた装置設定を、製品の呼び出しと同じweightURLとdeviceConfigの取り出し口経由で渡す
     func testGetModelPropagatesExplicitGPUDeviceConfigToModelConstructionSeam() {
         var capturedCalls: [(path: String, deviceConfig: ZenzaiDeviceConfig)] = []
         SharedZenzModelCache.modelConstructor = { path, deviceConfig in
@@ -51,8 +54,9 @@ final class ZenzDeviceConfigPropagationTests: XCTestCase {
         )
     }
 
-    /// A CPU-only device config (the implicit default used when no GPU is selected) must reach
-    /// the seam as CPU, not silently upgraded to GPU.
+    /// CPU専用設定がGPUへ格上げされずに届くことを検証する
+    ///
+    /// GPU未選択時の暗黙の既定が誤ってGPU扱いにならない
     func testGetModelPropagatesCPUDeviceConfigToModelConstructionSeam() {
         var capturedCalls: [(path: String, deviceConfig: ZenzaiDeviceConfig)] = []
         SharedZenzModelCache.modelConstructor = { path, deviceConfig in
@@ -76,11 +80,11 @@ final class ZenzDeviceConfigPropagationTests: XCTestCase {
         XCTAssertEqual(capturedCalls.first?.deviceConfig.gpuLayers, 0)
     }
 
-    // MARK: - Cache identity / separation
+    // MARK: - キャッシュの同一性と分離
 
-    /// `SharedZenzModelCache` must not share a cached model between two different device
-    /// configurations for the same weight path (e.g. CPU vs. GPU), or a device switch would
-    /// silently reuse a model loaded for the wrong device.
+    /// 同じ重みパスでも装置設定が違えばキャッシュを共有しないことを検証する
+    ///
+    /// 装置を切り替えたときに別装置向けのモデルを誤って再利用しない
     func testSharedZenzModelCacheKeySeparatesDeviceConfigsForSamePath() {
         let path = "/tmp/shared-zenz-model-cache-key-test.gguf"
         let cpuConfig = ZenzaiDeviceConfig(deviceName: nil, gpuLayers: 0)
@@ -93,7 +97,9 @@ final class ZenzDeviceConfigPropagationTests: XCTestCase {
         XCTAssertEqual(cpuKey, SharedZenzModelCache.cacheKey(path: path, deviceConfig: cpuConfig), "identical device configs must map to the same cache identity")
     }
 
-    /// The outer `Zenz`-level cache (keyed by resource URL) must apply the same separation rule.
+    /// 外側のZenz層のキャッシュも同じ分離規則に従うことを検証する
+    ///
+    /// 資源URLをキーにする層でも装置設定ごとに別物として扱う
     func testSharedZenzCacheKeySeparatesDeviceConfigsForSameURL() {
         let url = URL(fileURLWithPath: "/tmp/shared-zenz-cache-key-test.gguf")
         let cpuConfig = ZenzaiDeviceConfig(deviceName: nil, gpuLayers: 0)
@@ -106,10 +112,11 @@ final class ZenzDeviceConfigPropagationTests: XCTestCase {
         XCTAssertEqual(cpuKey, SharedZenzCache.cacheKey(resourceURL: url, deviceConfig: cpuConfig), "identical device configs must map to the same cache identity")
     }
 
-    /// `KanaKanjiConverter.getModel`'s instance-level fast path (`self.zenz`) must not reuse an
-    /// already-loaded `Zenz` when the requested device config differs from the cached one, even
-    /// for the same model URL. This is the pure predicate extracted from that fast path so it is
-    /// regression-testable without constructing a real llama.cpp context.
+    /// 読み込み済みのZenzを装置設定が違う要求に再利用しないことを検証する
+    ///
+    /// 同じモデルURLでも装置設定が違えば作り直し、一致するときだけ再利用する
+    ///
+    /// getModelの個体層の近道判定から抜き出した純粋述語で検証するため、実際のllama.cpp文脈は要らない
     func testZenzCanReuseRejectsMismatchedDeviceConfigForSameURL() {
         let url = URL(fileURLWithPath: "/tmp/zenz-instance-cache-test.gguf")
         let cpuConfig = ZenzaiDeviceConfig(deviceName: nil, gpuLayers: 0)

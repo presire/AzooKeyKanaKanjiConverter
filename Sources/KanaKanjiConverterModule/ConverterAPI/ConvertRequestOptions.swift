@@ -231,14 +231,25 @@ public struct ConvertRequestOptions: Sendable {
             var personalNgramLanguageModel: String
         }
 
-        /// Device configuration for Zenzai backend
+        /// Zenzaiバックエンドのデバイス構成
+        ///
+        /// 使用するGGMLデバイスとGPUへオフロードする層数を指定する
+        ///
+        /// - Note: 7ka-hiira/AzooKeyKanaKanjiConverterのcommit 8b4befcから移植
         public struct DeviceConfig: Sendable, Equatable {
+            /// デバイス構成を作る
+            ///
+            /// - Parameters:
+            ///   - deviceName: 使用するデバイス名 (nilの場合は自動選択)
+            ///   - gpuLayers: GPUへオフロードする層数 (0はCPUのみ)
             public init(deviceName: String? = nil, gpuLayers: Int32 = 0) {
                 self.deviceName = deviceName
                 self.gpuLayers = gpuLayers
             }
 
+            /// 使用するデバイス名 (nilの場合は自動選択)
             public var deviceName: String?
+            /// GPUへオフロードする層数 (0はCPUのみ)
             public var gpuLayers: Int32
         }
 
@@ -258,7 +269,7 @@ public struct ConvertRequestOptions: Sendable {
         ///    - requestRichCandidates: when this flag is true, the converter spends more time but generate richer N-Best candidates for candidate list view. Usually this option is not recommended for live conversion.
         ///    - personalizationMode: values for personalization.
         ///    - versionDependentMode: specify zenz model version and its configuration.
-        ///    - deviceConfig: configuration for GGML backend device (GPU layers, device selection).
+        ///    - deviceConfig: GGMLバックエンドデバイスの構成 (GPUへオフロードする層数とデバイス選択)
         public static func on(weight: URL, inferenceLimit: Int = 10, requestRichCandidates: Bool = false, personalizationMode: PersonalizationMode?, versionDependentMode: ZenzaiVersionDependentMode = .v3(.init()), deviceConfig: DeviceConfig = DeviceConfig()) -> Self {
             ZenzaiMode(
                 enabled: true,
@@ -276,6 +287,7 @@ public struct ConvertRequestOptions: Sendable {
         var requestRichCandidates: Bool
         var personalizationMode: PersonalizationMode?
         var versionDependentMode: ZenzaiVersionDependentMode
+        /// GGMLバックエンドデバイスの構成
         var deviceConfig: DeviceConfig
     }
 }

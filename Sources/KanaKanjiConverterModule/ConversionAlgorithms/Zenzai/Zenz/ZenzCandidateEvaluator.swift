@@ -141,15 +141,15 @@ struct ZenzCandidateEvaluator {
         debug("Evaluate", candidate)
         var userDictionaryPrompt = ""
         if !context.isJinenModel {
-            // [hazkey-community patch] jinen (Qwen3) は「辞書:」条件プロンプト
-            // (U+EE03-EE06 体系) を学習していないため、条件を付与しない。
+            // [Hazkey Community Patch]
+            // jinen (Qwen3) は「辞書:」条件プロンプト (U+EE03-EE06体系) を学習していないため条件を付与しない
             for item in candidate.data where item.metadata.contains(.isFromUserDictionary) {
                 userDictionaryPrompt += "\(item.word)(\(item.ruby.toHiragana()))"
             }
         }
-        // [hazkey-community patch] jinen では profile/topic/style/preference・右文脈・
-        // alignment separator を落とし、profile は左文脈の先頭へ畳み込む。
-        // zenz v3 と同一のタグ構造 (EE02/EE00/EE01) にする。
+        // [Hazkey Community Patch]
+        // jinenではprofile/topic/style/preferenceと右文脈とalignment separatorを落としprofileは左文脈の先頭へ畳み込む
+        // zenz v3と同一のタグ構造 (EE02/EE00/EE01) にする
         let effectiveConfig = context.isJinenModel
             ? Self.jinenEvaluationMode(versionDependentConfig)
             : versionDependentConfig
@@ -267,14 +267,37 @@ struct ZenzCandidateEvaluator {
         }
 
         var altTokens = FixedSizeHeap<AlternativeHighProbToken>(size: requestRichCandidates ? 5 : 0)
-        // [hazkey-community patch] 候補側のトークンだけを復号する。
-        // jinen の U+EE00〜EE02 は CONTROL トークンで、llama_token_to_piece(special: false) が空文字列に復号するため、
-        // プロンプトを含めて復号し dropFirst(normalizedPrompt) で落とす旧方式は生成の先頭を欠落させた。
-        // zenz では復号結果が normalizedPrompt とバイト同一なので結果は変わらない。
-        // 同じトークンスライスの先例は personalization 分岐 (tokens[..<i].dropFirst(promptTokens.count)) にある。
-        func decodeCandidatePieces(upTo i: Int) -> [CChar] {
-            tokens[promptTokens.count ..< i].reduce(into: []) {
-                $0.append(contentsOf: context.tokenToPiece(token: $1))
+        // [Hazkey Community Patch]
+        // 候補側のトークンだけを復号する
+        // jinenのU+EE00〜EE02はCONTROLトークンでllama_token_to_piece(special: false)が空文字列に復号するため、
+        // プロンプトを含めて復号しdropFirst(normalizedPrompt)で落とす旧方式は生成の先頭を欠落させた
+        // zenzでは復号結果がnormalizedPromptとバイト同一なので結果は変わらない
+        // 同じトークンスライスの先例はpersonalization分岐 (tokens[..<i].dropFirst(promptTokens.count)) にある
+        // [Hazkey Community Patch] 候補の先頭部分の復号を積み上げ式にする。
+        // i は評価ループで単調増加するため、前回までの復号結果に tokens[decodedCandidateEnd ..< i] だけを足す。
+        // 呼ばれた時にだけ伸ばすので、非 rich 経路の復号量は従来と変わらず、学習優先で次へ進む経路も自然に含まれる。
+        var decodedCandidateBytes: [UInt8] = []
+        var decodedCandidateEnd = promptTokens.count
+        func appendPieces(of slice: ArraySlice<llama_token>, to bytes: inout [UInt8]) {
+            for token in slice {
+                bytes.append(contentsOf: context.tokenToPiece(token: token).map { UInt8(bitPattern: $0) })
+            }
+        }
+        func decodeCandidatePieces(upTo i: Int) -> [UInt8] {
+            guard i >= decodedCandidateEnd else {
+                var bytes: [UInt8] = []
+                appendPieces(of: tokens[promptTokens.count ..< i], to: &bytes)
+                return bytes
+            }
+            appendPieces(of: tokens[decodedCandidateEnd ..< i], to: &decodedCandidateBytes)
+            decodedCandidateEnd = i
+            return decodedCandidateBytes
+        }
+
+        var vocabScanNanoseconds: UInt64 = 0
+        defer {
+            if vocabScanNanoseconds > 0 {
+                ZenzInferencePerf.shared.count { $0.vocabScanNanoseconds &+= vocabScanNanoseconds }
             }
         }
 
@@ -289,6 +312,7 @@ struct ZenzCandidateEvaluator {
                 let endIndex = startIndex + n_vocab
                 var tokenHeap = FixedSizeHeap<TokenAndLogit>(size: requestRichCandidates ? 3 : 0)
                 let maxItem: TokenAndLogit
+                let vocabScanStartedAt = ZenzInferencePerf.shared.now()
 
                 if let (mode, baseLM, personalLM) = personalizationMode, mode.alpha > 0 {
                     let prefix = tokens[..<i].dropFirst(promptTokens.count).map(Int.init)
@@ -366,11 +390,11 @@ struct ZenzCandidateEvaluator {
                         logit: maximumLogit
                     )
                 }
+                vocabScanNanoseconds &+= ZenzInferencePerf.shared.elapsed(since: vocabScanStartedAt)
 
                 if maxItem.token != tokenID {
                     if maxItem.token == context.eosToken {
-                        let cchars = decodeCandidatePieces(upTo: i)
-                        let data = Data(cchars.map { UInt8(bitPattern: $0) })
+                        let data = Data(decodeCandidatePieces(upTo: i))
                         let wholeResult = String(data: data, encoding: .utf8) ?? ""
                         return finish(.wholeResult(wholeResult))
                     } else {
@@ -382,11 +406,11 @@ struct ZenzCandidateEvaluator {
                         let preferLearnedToken = learnedPriority > 0
                             && logits[startIndex + Int(tokenID)] + learnedPriority > maxItem.logit
                         if !preferLearnedToken {
-                            let cchars = decodeCandidatePieces(upTo: i)
-                                + context.tokenToPiece(token: maxItem.token)
+                            let bytes = decodeCandidatePieces(upTo: i)
+                                + context.tokenToPiece(token: maxItem.token).map { UInt8(bitPattern: $0) }
                             return finish(
                                 .fixRequired(
-                                    prefixConstraint: cchars.map(UInt8.init)
+                                    prefixConstraint: bytes
                                 )
                             )
                         }
@@ -399,8 +423,8 @@ struct ZenzCandidateEvaluator {
                         altTokens.insertIfPossible(
                             AlternativeHighProbToken(
                                 token: item.token,
-                                constraint: prefix.map(UInt8.init)
-                                    + context.tokenToPiece(token: item.token).map(UInt8.init),
+                                constraint: prefix
+                                    + context.tokenToPiece(token: item.token).map { UInt8(bitPattern: $0) },
                                 probabilityRatioToMaxProb: expf(item.logit - maxItem.logit)
                             )
                         )
@@ -420,7 +444,8 @@ struct ZenzCandidateEvaluator {
             let evaluationTokens = Array(tokens.dropLast())
             guard let logits = context.evaluationLogits(
                 tokens: evaluationTokens,
-                startOffset: startOffset
+                startOffset: startOffset,
+                isRichEvaluation: requestRichCandidates
             ) else {
                 debug("logits unavailable")
                 return .error
@@ -443,8 +468,13 @@ struct ZenzCandidateEvaluator {
         )
     }
 
-    /// [hazkey-community patch] jinen (Qwen3) 用に v3 条件 (profile/topic/style/preference)、
-    /// 右文脈、alignment separator を除いたモードを返す。既存 zenz のモードは無変更。
+    /// jinen (Qwen3) 用にv3条件 (profile/topic/style/preference) と右文脈とalignment separatorを除いたモードを返す
+    ///
+    /// 既存zenzのモードは無変更
+    ///
+    /// - Parameter config: 条件を取り除く対象のバージョン別モード
+    /// - Returns: jinen向けに調整したバージョン別モード
+    /// - Note: [Hazkey Community Patch]
     static func jinenAdjustedMode(
         _ config: ConvertRequestOptions.ZenzaiVersionDependentMode
     ) -> ConvertRequestOptions.ZenzaiVersionDependentMode {
@@ -462,21 +492,33 @@ struct ZenzCandidateEvaluator {
         }
     }
 
-    /// [hazkey-community patch] jinen 用の区切り文字。karukan (jinen 作者の IME、
-    /// karukan-im/core/src/core/engine/model.rs) はペルソナと文脈を半角空白でつなぐが、
-    /// hazkey が使う llama.cpp 内蔵トークナイザでは NFKC 後の U+0020 がバイトフォールバック
-    /// (230,154,133) になり、学習時の HF 符号化 (260) と食い違うことを todo 1 の判定ゲートで
-    /// 実測した (S=" " は 0/12 一致、S="。" は 12/12 一致)。そのため既定は句点とする。
+    /// jinen用の区切り文字
+    ///
+    /// karukan (jinen作者のIME、karukan-im/core/src/core/engine/model.rs) はペルソナと文脈を半角空白でつなぐが、
+    /// hazkeyが使うllama.cpp内蔵トークナイザではNFKC後のU+0020がバイトフォールバック (230,154,133) になり学習時のHF符号化 (260) と食い違うことをtodo 1の判定ゲートで実測した (S=" "は0/12一致、S="。"は12/12一致)
+    ///
+    /// そのため既定は句点とする
+    ///
+    /// - Note: [Hazkey Community Patch]
     static let jinenPersonaSeparator = "。"
 
-    /// [hazkey-community patch] jinen (Qwen3) の候補評価用モード。`jinenAdjustedMode` の結果に、
-    /// 元の v3 `profile` を左文脈の先頭へ「P + S + C」として畳み込む。P は NFKC → trim →
-    /// 末尾 25 文字 → trim (karukan の persona 正規化と同じ順序に切り口の trim を加えたもの)、
-    /// S は `jinenPersonaSeparator` (P が既に文末記号 。 . ! ? で終わるときは空にする)、
-    /// C は従来の切り詰め (`mode.maxLeftSideContextLength ?? 40`、40 の出所は
-    /// `ZenzPromptBuilder.trimmedModeContext` の既定値) を先に適用した左文脈。
-    /// 畳み込み後の全体長を `maxLeftSideContextLength` に固定するため、ペルソナは別枠で
-    /// 残り、後段の `suffix` で切られない。profile が空なら調整済みモードをそのまま返す。
+    /// jinen (Qwen3) の候補評価用モード
+    ///
+    /// jinenAdjustedModeの結果に元のv3 profileを左文脈の先頭へ「P + S + C」として畳み込む
+    ///
+    /// PはNFKC→trim→末尾25文字→trim (karukanのpersona正規化と同じ順序に切り口のtrimを加えたもの)
+    ///
+    /// SはjinenPersonaSeparator (Pが既に文末記号。、.!?で終わるときは空にする)
+    ///
+    /// Cは従来の切り詰め (mode.maxLeftSideContextLength ?? 40、40の出所はZenzPromptBuilder.trimmedModeContextの既定値) を先に適用した左文脈
+    ///
+    /// 畳み込み後の全体長をmaxLeftSideContextLengthに固定するためペルソナは別枠で残り後段のsuffixで切られない
+    ///
+    /// profileが空なら調整済みモードをそのまま返す
+    ///
+    /// - Parameter config: 畳み込み元のバージョン別モード
+    /// - Returns: profileを左文脈へ畳み込んだバージョン別モード
+    /// - Note: [Hazkey Community Patch]
     static func jinenEvaluationMode(
         _ config: ConvertRequestOptions.ZenzaiVersionDependentMode
     ) -> ConvertRequestOptions.ZenzaiVersionDependentMode {

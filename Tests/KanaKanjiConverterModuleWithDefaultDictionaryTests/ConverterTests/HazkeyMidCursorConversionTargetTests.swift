@@ -3,12 +3,22 @@ import Foundation
 @testable import KanaKanjiConverterModuleWithDefaultDictionary
 import XCTest
 
-// [hazkey-community patch] Zenzai 要求中でカーソル途中の変換を、カーソルまでの読みで後処理することを検査する。
-// 実モデルは使わず、`SharedZenzModelCache.modelConstructor` を常に失敗するクロージャへ差し替えて
-// 非Zenzai経路へのフォールバックを再現する (llama-mockのモデル読込はfatalErrorになるため)。
+// [Hazkey Community Patch]
+// Zenzai要求中でカーソル途中の変換をカーソルまでの読みで後処理することの回帰テストをまとめる
+// 実モデルは使わず、SharedZenzModelCacheのmodelConstructorを常に失敗する差し替えで非Zenzai経路へのフォールバックを再現する
+// llama-mockのモデル読込はfatalErrorになるため
+/// Zenzai要求中のカーソル途中変換の回帰テストをまとめる
+///
+/// モデル読込失敗時はカーソルまでの読みで後処理し、セッション状態を壊さない
 final class HazkeyMidCursorConversionTargetTests: XCTestCase {
+    /// 構築の差し替え口へ到達したことを観測するための送出用エラー
+    ///
+    /// わざと失敗させて非Zenzai経路へのフォールバックを再現する
     private struct SentinelConstructionError: Error {}
 
+    /// 全テストでモデル構築を常に失敗する差し替えに置き換える
+    ///
+    /// モデル読込失敗時のフォールバック経路を実モデルなしで再現する
     override func setUp() {
         SharedZenzModelCache.modelConstructor = { _, _ in
             throw SentinelConstructionError()
@@ -16,12 +26,17 @@ final class HazkeyMidCursorConversionTargetTests: XCTestCase {
         super.setUp()
     }
 
+    /// モデル構築を製品の初期化子へ戻す
+    ///
+    /// 他のテストへ差し替えが漏れないようにする
     override func tearDown() {
         SharedZenzModelCache.modelConstructor = SharedZenzModel.init
         super.tearDown()
     }
 
-    /// 「にほんご」のカーソルを2文字戻す (カーソルまでの読みは「にほ」)。
+    /// カーソル途中の入力を作る
+    ///
+    /// にほんごのカーソルを2文字戻し、カーソルまでの読みをにほにする
     private func midCursorComposingText() -> ComposingText {
         var c = ComposingText()
         c.insertAtCursorPosition("にほんご", inputStyle: .direct)
@@ -29,12 +44,20 @@ final class HazkeyMidCursorConversionTargetTests: XCTestCase {
         return c
     }
 
+    /// カーソル末尾の入力を作る
+    ///
+    /// 全文変換の対照条件に使う
     private func endCursorComposingText() -> ComposingText {
         var c = ComposingText()
         c.insertAtCursorPosition("にほんご", inputStyle: .direct)
         return c
     }
 
+    /// Zenzai有効の変換モードを作る
+    ///
+    /// 重みパスは実在しなくてもよく、差し替えの失敗でフォールバックに入る
+    ///
+    /// - Returns: 一時パスの重みを指すZenzai有効モード
     private func zenzaiModeOn() -> ConvertRequestOptions.ZenzaiMode {
         .on(
             weight: URL(fileURLWithPath: "/tmp/hazkey-mid-cursor-conversion-target-\(UUID().uuidString).gguf"),
@@ -42,6 +65,12 @@ final class HazkeyMidCursorConversionTargetTests: XCTestCase {
         )
     }
 
+    /// 検証用の変換要求を作る
+    ///
+    /// Zenzai条件以外は固定し、学習や誤字訂正の影響を除く
+    ///
+    /// - Parameter zenzaiMode: 検証したいZenzai条件
+    /// - Returns: 固定条件の変換要求
     private func requestOptions(zenzaiMode: ConvertRequestOptions.ZenzaiMode) -> ConvertRequestOptions {
         ConvertRequestOptions(
             N_best: 10,
@@ -64,7 +93,9 @@ final class HazkeyMidCursorConversionTargetTests: XCTestCase {
         )
     }
 
-    /// (a) Zenzai要求中・カーソル途中・モデル読込失敗のとき、候補はカーソルまでの読みに収まる。
+    /// モデル読込失敗時はカーソルまでの読みだけを変換することを検証する (a)
+    ///
+    /// 候補の読みがカーソル位置を超えず、カーソルまでの読みの新規変換と一致する
     func testZenzaiRequestWithMidCursorConvertsOnlyTheCursorPrefixWhenModelFailsToLoad() {
         let converter = KanaKanjiConverter.withDefaultDictionary()
         let input = midCursorComposingText()
@@ -95,8 +126,9 @@ final class HazkeyMidCursorConversionTargetTests: XCTestCase {
         )
     }
 
-    /// (b) 同じセッションで、カーソル途中のZenzai要求の後にZenzai OFFの要求をしても、
-    /// セッション状態が不整合にならず、新規変換器と同じ結果になる。
+    /// カーソル途中のZenzai要求後もセッション状態が保たれることを検証する (b)
+    ///
+    /// 続くZenzai OFF要求が新規変換器と同じ結果になり、同じZenzai要求の再送も結果を変えない
     func testSessionStateStaysConsistentAfterMidCursorZenzaiRequest() {
         let converter = KanaKanjiConverter.withDefaultDictionary()
         let input = midCursorComposingText()
@@ -122,7 +154,7 @@ final class HazkeyMidCursorConversionTargetTests: XCTestCase {
             "Zenzai要求の後のZenzai OFF変換は、新規変換器と同じ件数の候補を返すべき"
         )
 
-        // 同じ変換器で全文・カーソル途中のZenzai要求を2回続けると、2回目の結果が1回目と一致する。
+        // 同じ変換器で全文・カーソル途中のZenzai要求を2回続けると、2回目の結果が1回目と一致する
         let repeatConverter = KanaKanjiConverter.withDefaultDictionary()
         let first = repeatConverter.requestCandidates(input, options: requestOptions(zenzaiMode: zenzaiModeOn()))
         let secondOfSameRequest = repeatConverter.requestCandidates(input, options: requestOptions(zenzaiMode: zenzaiModeOn()))
@@ -133,7 +165,9 @@ final class HazkeyMidCursorConversionTargetTests: XCTestCase {
         )
     }
 
-    /// (c) Zenzai OFFのときは、カーソル途中でも全文の読みの候補が保たれる (上流の挙動の回帰ガード)。
+    /// Zenzai OFFではカーソル途中でも全文を変換することを検証する (c)
+    ///
+    /// 上流の挙動を保つ回帰ガードであり、全文読みの候補が少なくとも1つある
     func testZenzaiOffKeepsFullInputConversionForMidCursor() {
         let converter = KanaKanjiConverter.withDefaultDictionary()
         let result = converter.requestCandidates(
@@ -146,29 +180,35 @@ final class HazkeyMidCursorConversionTargetTests: XCTestCase {
         )
     }
 
+    /// 指定した読みのComposingTextを作る
+    ///
+    /// 部分確定後の接尾辞編集の再現に使う
+    ///
+    /// - Parameter string: カーソル末尾に挿入する読み
+    /// - Returns: 指定した読みを持つComposingText
     private func composingText(_ string: String) -> ComposingText {
         var c = ComposingText()
         c.insertAtCursorPosition(string, inputStyle: .direct)
         return c
     }
 
-    /// (e) Zenzai由来ラティスを破棄する再構築では確定状態も破棄することの回帰検査。
-    /// 部分確定 → フォールバック再構築 → 編集の順で、破棄済みZenzaiラティスに属する
-    /// 古い completedData が kana2lattice_afterComplete に再利用されないことを検査する。
+    /// Zenzai由来ラティスの破棄再構築では確定状態も捨てることを検証する (e)
+    ///
+    /// 部分確定の後にフォールバック再構築と編集が続いても、破棄済みラティスに属する古い確定状態がkana2lattice_afterComplete経路に再利用されない
     func testDiscardingZenzaiLatticeAlsoClearsCompletedData() {
         let options = requestOptions(zenzaiMode: .off)
         let converter = KanaKanjiConverter.withDefaultDictionary()
         let full = composingText("わたしはがくせいです")
         let first = converter.requestCandidates(full, options: options)
         XCTAssertFalse(first.mainResults.isEmpty, "前提: 全文の変換候補が空であってはならない")
-        // 部分確定を再現する: 先頭候補を確定状態として積む。
+        // 部分確定を再現する: 先頭候補を確定状態として積む
         converter.setCompletedData(first.mainResults[0])
         // Zenzai由来ラティスが残っている状態を再現する (実モデルは使えないため印だけ立てる)。
         converter.updateCurrentSessionState { $0.latticeIsFromZenzai = true }
         // フォールバック再構築: 非Zenzai要求で編集済み入力を変換する。
         let truncated = composingText("わたしはがくせい")
         _ = converter.requestCandidates(truncated, options: options)
-        // 次の編集は再構築後入力の接尾辞 → 古い確定状態が残っていると afterComplete 経路に入る。
+        // 次の編集は再構築後入力の接尾辞であり、古い確定状態が残っているとafterComplete経路に入る
         let final = composingText("はがくせい")
         let actual = converter.requestCandidates(final, options: options)
 
@@ -186,7 +226,9 @@ final class HazkeyMidCursorConversionTargetTests: XCTestCase {
         )
     }
 
-    /// (d) 変換対象の選択の純関数の表検査。
+    /// 変換対象選択の純関数の対応表を検証する (d)
+    ///
+    /// Zenzai要求ありとカーソル途中の組み合わせだけがカーソルまでの読みになり、他は全文になる
     func testPureConversionTargetSelection() {
         let midCursor = midCursorComposingText()
         let endCursor = endCursorComposingText()

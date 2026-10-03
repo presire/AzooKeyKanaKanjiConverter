@@ -11,9 +11,20 @@ import EfficientNGram
 public import Foundation
 import SwiftUtils
 
-// [hazkey-community patch] Zenzai要求中でカーソル途中のときだけ変換対象をカーソルまでの読みに切り詰める純関数。
-// Zenzaiを使わないセッションでは全文がそのまま返るため、上流の挙動は変わらない。
+// [Hazkey Community Patch]
+// Zenzai要求中でカーソル途中のときだけ変換対象をカーソルまでの読みに切り詰める純関数
+//
+// Zenzaiを使わない要求では全文がそのまま返るため上流の挙動は変わらない
 extension Kana2Kanji {
+    /// Zenzai要求中でカーソル途中のときだけ変換対象をカーソルまでの読みに切り詰める
+    ///
+    /// Zenzaiを使わない要求では全文がそのまま返るため上流の挙動は変わらない
+    ///
+    /// - Parameters:
+    ///   - inputData: 変換対象の入力
+    ///   - zenzaiRequested: Zenzai変換が要求されているかどうか
+    /// - Returns: 後処理とセッション状態の保存に使う変換対象
+    /// - Note: [Hazkey Community Patch]
     static func hazkeyConversionTarget(for inputData: ComposingText, zenzaiRequested: Bool) -> ComposingText {
         (zenzaiRequested && !inputData.isAtEndIndex) ? inputData.prefixToCursorPosition() : inputData
     }
@@ -31,11 +42,14 @@ public final class KanaKanjiConverter {
     }
 
     private let converter: Kana2Kanji
-    // @testableなテストから latticeIsFromZenzai を操作するために internal とする。
+    // @testableなテストからlatticeIsFromZenzaiを操作するためにinternalとする
     struct ConversionSessionState {
         var previousInputData: ComposingText?
-        // [hazkey-community patch] 現在のラティスがall_zenzaiで作られたものかどうか。
-        // 非Zenzai経路で差分更新に再利用すると候補が失われるため、作り直しの判定に使う。
+        /// 現在のラティスがall_zenzaiで作られたものかどうかを示す
+        ///
+        /// 非Zenzai経路で差分更新に再利用すると候補が失われるため作り直しの判定に使う
+        ///
+        /// - Note: [Hazkey Community Patch]
         var latticeIsFromZenzai = false
         var lattice: Lattice = .init()
         var completedData: Candidate?
@@ -52,6 +66,14 @@ public final class KanaKanjiConverter {
         self.converter = .init(dicdataStore: dicdataStore)
         self.dicdataStoreState = dicdataStore.prepareState()
     }
+    /// 辞書と単一の補助辞書から変換器を作る
+    ///
+    /// 複数補助辞書版への互換窓口で補助辞書は先頭ソースとして登録される
+    ///
+    /// - Parameters:
+    ///   - dictionaryURL: システム辞書の置き場
+    ///   - supplementalDictionaryURL: 補助辞書の置き場 (nilの場合は補助辞書なし)
+    ///   - preloadDictionary: 辞書を先読みするかどうか
     public convenience init(dictionaryURL: URL, supplementalDictionaryURL: URL? = nil, preloadDictionary: Bool = false) {
         let dicdataStore = DicdataStore(
             dictionaryURL: dictionaryURL,
@@ -60,6 +82,15 @@ public final class KanaKanjiConverter {
         )
         self.init(dicdataStore: dicdataStore)
     }
+    /// 辞書と複数の補助辞書ソースから変換器を作る
+    ///
+    /// ソースは構築時に固定されIDの重複や不正なIDでは失敗する
+    ///
+    /// - Parameters:
+    ///   - dictionaryURL: システム辞書の置き場
+    ///   - supplementalDictionaries: 補助辞書ソースの宣言順の一覧
+    ///   - preloadDictionary: 辞書を先読みするかどうか
+    /// - Throws: ソースが空やID重複や不正IDの場合はSupplementalDictionaryConfigurationError
     public convenience init(
         dictionaryURL: URL,
         supplementalDictionaries: [SupplementalDictionarySource],
@@ -105,7 +136,7 @@ public final class KanaKanjiConverter {
         self.sessions[self.activeSessionID] ?? .init()
     }
 
-    // @testableなテストからセッション状態を操作するために internal とする。
+    // @testableなテストからセッション状態を操作するためにinternalとする
     func updateCurrentSessionState(_ update: (inout ConversionSessionState) -> Void) {
         var state = self.currentSessionState
         update(&state)
@@ -287,13 +318,15 @@ public final class KanaKanjiConverter {
         return uniqueStableCandidates + additionalCandidates
     }
 
+    /// Zenzaiモデルを取得する
+    ///
+    /// 要求された重みとデバイス構成がキャッシュと一致すれば再利用し異なる構成が要求された場合は作り直す
+    ///
     /// - Parameters:
-    ///   - modelURL: Zenzaiモデルの重みファイルパス。
-    ///   - deviceConfig: GGMLバックエンドデバイス構成 (GPUオフロード層数・デバイス名)。
-    ///     `ConvertRequestOptions.ZenzaiMode.deviceConfig`から伝播する。CPU/GPUなど異なる構成が
-    ///     要求された場合、インスタンスキャッシュ (`self.zenz`) も共有キャッシュ
-    ///     (`SharedZenzCache` / `SharedZenzModelCache`) も再利用してはならない
-    ///     (`Zenz.canReuse` 参照)。
+    ///   - modelURL: Zenzaiモデルの重みファイルパス
+    ///   - deviceConfig: GGMLバックエンドデバイス構成 (GPUオフロード層数・デバイス名)
+    ///     ConvertRequestOptions.ZenzaiMode.deviceConfigから伝播する
+    /// - Returns: 利用可能なZenzaiモデル (読込に失敗した場合はnil)
     package func getModel(modelURL: URL, deviceConfig: ZenzaiDeviceConfig = ZenzaiDeviceConfig()) -> Zenz? {
         if let model = self.zenz, Zenz.canReuse(cachedURL: model.resourceURL, cachedDeviceConfig: model.deviceConfig, requestedURL: modelURL, requestedDeviceConfig: deviceConfig) {
             self.zenzStatus = "load \(modelURL.absoluteString)"
@@ -465,12 +498,16 @@ public final class KanaKanjiConverter {
         self.dicdataStoreState.updateLearningConfig(newConfig)
     }
 
-    /// 先頭の補助辞書が利用可能かどうか。ディレクトリ欠落や`charID.chid`不一致で無効化された場合は`false`。
+    /// 先頭の補助辞書が利用可能かどうかを示す
+    ///
+    /// ディレクトリ欠落やcharID.chid不一致で無効化された場合はfalse
     public var isSupplementalDictionaryAvailable: Bool {
         self.converter.dicdataStore.hasSupplementalDictionary
     }
 
-    /// 先頭の補助辞書を有効/無効にする。
+    /// 先頭の補助辞書を有効化または無効化する
+    ///
+    /// - Parameter enabled: 有効にするかどうか
     public func setSupplementalDictionaryEnabled(_ enabled: Bool) {
         guard let firstID = self.dicdataStoreState.firstSupplementalSourceID else {
             return
@@ -478,12 +515,24 @@ public final class KanaKanjiConverter {
         self.setSupplementalDictionaryEnabled(enabled, for: firstID)
     }
 
-    /// 指定IDの補助辞書が登録済みかつ検証済みかどうか。実行時の有効/無効には依存しない。
+    /// 指定IDの補助辞書が登録済みかつ検証済みかどうかを示す
+    ///
+    /// 実行時の有効と無効には依存しない
+    ///
+    /// - Parameter id: 補助辞書ソースのID
+    /// - Returns: 登録済みかつ検証済みの場合のみtrue
     public func isSupplementalDictionaryAvailable(for id: String) -> Bool {
         self.converter.dicdataStore.isSupplementalDictionaryAvailable(for: id)
     }
 
-    /// 指定IDの補助辞書を有効/無効にする。未登録のIDでは何もせず`false`を返す。
+    /// 指定IDの補助辞書を有効化または無効化する
+    ///
+    /// 未登録のIDでは何もせずfalseを返す
+    ///
+    /// - Parameters:
+    ///   - enabled: 有効にするかどうか
+    ///   - id: 補助辞書ソースのID
+    /// - Returns: フラグを更新した場合はtrue
     @discardableResult
     public func setSupplementalDictionaryEnabled(_ enabled: Bool, for id: String) -> Bool {
         let wasEnabled = self.dicdataStoreState.isSupplementalDictionaryEnabled(id)
@@ -496,8 +545,9 @@ public final class KanaKanjiConverter {
         return true
     }
 
-    /// 補助辞書の有効フラグが変わった後、変更前の辞書から作った変換結果を再利用しないよう破棄する。
-    /// 利用者が明示的に受け入れた予測候補と、学習用の直前の確定語だけは保持する。
+    /// 補助辞書の有効フラグが変わった後に変更前の辞書から作った変換結果を再利用しないよう破棄する
+    ///
+    /// 利用者が明示的に受け入れた予測候補と学習用の直前の確定語だけは保持する
     private func invalidateSupplementalDictionaryDependentCaches() {
         self.purgeZenzaiMemoizationCache()
         self.sessions = self.sessions.mapValues { state in
@@ -594,6 +644,7 @@ public final class KanaKanjiConverter {
     }
 
     /// 確定操作後の学習メモリの更新を確定させます。
+    /// - Throws: 学習データの保存に失敗した場合
     public func commitUpdateLearningData() throws {
         try self.dicdataStoreState.saveMemory()
     }
@@ -603,14 +654,27 @@ public final class KanaKanjiConverter {
         self.dicdataStoreState.forgetMemory(candidate)
     }
 
-    /// 指定した読み・表記・接続IDに完全一致する学習メモリのみを削除します。
+    /// 指定した読みと表記と接続IDに完全一致する学習メモリだけを削除する
+    ///
+    /// - Parameters:
+    ///   - reading: 削除対象の読み
+    ///   - word: 削除対象の表記
+    ///   - lcid: 削除対象の左接続ID
+    ///   - rcid: 削除対象の右接続ID
+    /// - Throws: 学習メモリの保存先が無い場合や削除の保存に失敗した場合
     public func forgetLearningMemory(reading: String, word: String, lcid: Int, rcid: Int) throws {
         try self.dicdataStoreState.forgetLearningMemory(
             exactly: .init(reading: reading, word: word, lcid: lcid, rcid: rcid)
         )
     }
 
-    /// 永続化済み学習メモリをページ単位で取得します。
+    /// 永続化済み学習メモリをページ単位で取得する
+    ///
+    /// - Parameters:
+    ///   - offset: 取得開始位置
+    ///   - limit: 取得件数の上限 (1から1024の範囲に丸める)
+    /// - Returns: 取得したページ
+    /// - Throws: 開始位置が負の場合や学習メモリの読込に失敗した場合
     public func learningMemoryEntries(offset: Int = 0, limit: Int = 256) throws -> LearningMemoryPage {
         try self.dicdataStoreState.learningMemoryEntries(
             offset: offset,
@@ -618,20 +682,27 @@ public final class KanaKanjiConverter {
         )
     }
 
-    /// 永続化済み学習メモリを1回の走査でまとめて取得します。
+    /// 永続化済み学習メモリを1回の走査でまとめて取得する
     ///
-    /// `learningMemoryEntries(offset:limit:)` と異なり `limit` を丸めず、
-    /// 指定件数に達した時点で走査を打ち切ります。
+    /// learningMemoryEntries(offset:limit:)と異なりlimitを丸めず指定件数に達した時点で走査を打ち切る
+    ///
+    /// - Parameter limit: 取得件数の上限 (負の場合は0として扱う)
+    /// - Returns: 取得したページ
+    /// - Throws: 学習メモリの読込に失敗した場合
     public func allLearningMemoryEntries(limit: Int) throws -> LearningMemoryPage {
         try self.dicdataStoreState.learningMemoryEntriesSinglePass(limit: max(limit, 0))
     }
 
-    /// 永続化済み学習メモリから、指定した読みに完全一致するエントリのキーを取得します。
+    /// 永続化済み学習メモリから指定した読みに完全一致するエントリのキーを取得する
     ///
-    /// 変換経路がキャッシュしている memory LOUDS を用いたポイント照会なので、
-    /// 保存件数に依存しません。一時記憶 (未永続化の学習) は含みません。
-    /// - Note: `memoryDirectoryURL` は `requestCandidates(_:options:)` の内部で遅延適用されるため、
-    ///   プロファイル切替直後は変換要求の**後**に呼ぶ必要があります。
+    /// 変換経路がキャッシュしているmemory LOUDSを用いたポイント照会なので保存件数に依存しない
+    ///
+    /// 一時記憶 (未永続化の学習) は含まない
+    ///
+    /// - Parameter exactReadings: 完全一致で探す読みの一覧
+    /// - Returns: 読みと表記と品詞IDのキーの一覧
+    /// - Throws: 学習データの置き場が無い場合や停止中や破損の場合
+    /// - Note: memoryDirectoryURLはrequestCandidates(_:options:)の内部で遅延適用されるためプロファイル切替直後は変換要求の**後**に呼ぶ必要がある
     public func persistedLearningMemoryKeys(exactReadings: [String]) throws -> [PersistedLearningMemoryKey] {
         try self.dicdataStoreState.persistedLearningMemoryKeys(exactReadings: exactReadings)
     }
@@ -1337,11 +1408,12 @@ public final class KanaKanjiConverter {
     /// - Parameters:
     ///   - inputData: 変換対象のInputData。
     ///   - N_best: 計算途中で保存する候補数。実際に得られる候補数とは異なる。
-    ///   - conversionTarget: ラティス構築とセッション状態の保存に使う変換対象。
+    ///   - conversionTarget: ラティス構築とセッション状態の保存に使う変換対象
     /// - Returns:
     ///   結果のラティスノードと、計算済みノードの全体
     private func convertToLattice(_ inputData: ComposingText, N_best: Int, zenzaiMode: ConvertRequestOptions.ZenzaiMode, needTypoCorrection: Bool, conversionTarget: ComposingText) -> (result: LatticeNode, lattice: Lattice)? {
-        // [hazkey-community patch] カーソル位置0では変換対象が空になるため、全文の入力があっても何もしない
+        // [Hazkey Community Patch]
+        // カーソル位置0では変換対象が空になるため全文の入力があっても何もしない
         if conversionTarget.convertTarget.isEmpty {
             return nil
         }
@@ -1360,8 +1432,8 @@ public final class KanaKanjiConverter {
                 dicdataStoreState: self.dicdataStoreState
             )
             self.updateCurrentSessionState {
-                // [hazkey-community patch] all_zenzaiはカーソルまでの読みのラティスを作るため、
-                // セッションにはカーソルまでの読みを保存し、Zenzai由来の印を残す
+                // [Hazkey Community Patch]
+                // all_zenzaiはカーソルまでの読みのラティスを作るためセッションにはカーソルまでの読みを保存しZenzai由来の印を残す
                 $0.previousInputData = conversionTarget
                 $0.latticeIsFromZenzai = true
                 $0.zenzaiCache = cache
@@ -1369,8 +1441,8 @@ public final class KanaKanjiConverter {
             return (result, nodes)
         }
 
-        // [hazkey-community patch] Zenzaiが作ったラティスはキャッシュ命中時に先頭の列だけ、
-        // 通常時もbest-1の制約付き探索の結果であり、差分更新に使うと候補が失われるため作り直す
+        // [Hazkey Community Patch]
+        // Zenzaiが作ったラティスはキャッシュ命中時に先頭の列だけ、通常時もbest-1の制約付き探索の結果であり差分更新に使うと候補が失われるため作り直す
         if self.currentSessionState.latticeIsFromZenzai {
             debug("\(#function): Zenzai由来のラティスを破棄して新規計算用の関数を呼びます")
             let result = converter.kana2lattice_all(
@@ -1382,7 +1454,8 @@ public final class KanaKanjiConverter {
             self.updateCurrentSessionState {
                 $0.previousInputData = conversionTarget
                 $0.latticeIsFromZenzai = false
-                // [hazkey-community patch] 破棄したZenzai由来ラティスに属する確定状態は再利用しない。
+                // [Hazkey Community Patch]
+                // 破棄したZenzai由来ラティスに属する確定状態は再利用しない
                 $0.completedData = nil
             }
             return result
@@ -1480,7 +1553,8 @@ public final class KanaKanjiConverter {
         }
         self.dicdataStoreState.updateIfRequired(options: options)
         let needTypoCorrection = self.isClassicTypoCorrectionEnabled(options)
-        // [hazkey-community patch] Zenzai要求中でカーソル途中のときは、後処理とセッション状態をカーソルまでの読みで扱う
+        // [Hazkey Community Patch]
+        // Zenzai要求中でカーソル途中のときは後処理とセッション状態をカーソルまでの読みで扱う
         let conversionTarget = Kana2Kanji.hazkeyConversionTarget(for: inputData, zenzaiRequested: options.zenzaiMode.enabled)
 
         guard let result = self.convertToLattice(inputData, N_best: options.N_best, zenzaiMode: options.zenzaiMode, needTypoCorrection: needTypoCorrection, conversionTarget: conversionTarget) else {

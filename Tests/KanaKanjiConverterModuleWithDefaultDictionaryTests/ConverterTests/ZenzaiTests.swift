@@ -6,11 +6,14 @@ import XCTest
 
 #if Zenzai || ZenzaiCPU
 final class ZenzaiTests: XCTestCase {
+    /// 実機の重み配置を指すZenzai重みURL
     private static let zenzaiWeightURL = URL(
         fileURLWithPath: "/Library/Input Methods/azooKeyMac.app/Contents/Resources/ggml-model-Q5_K_M.gguf"
     )
 
-    /// 重みが無い環境ではZenzaiが素の辞書変換へ縮退するため、推論結果を期待するテストは成立しない。
+    /// 重みが無い環境ではテストを中断する
+    ///
+    /// 重みが無い環境ではZenzaiが素の辞書変換へ縮退するため、推論結果を期待するテストは成立しない
     private func skipUnlessZenzaiWeightIsAvailable() throws {
         try XCTSkipUnless(
             FileManager.default.fileExists(atPath: Self.zenzaiWeightURL.path),

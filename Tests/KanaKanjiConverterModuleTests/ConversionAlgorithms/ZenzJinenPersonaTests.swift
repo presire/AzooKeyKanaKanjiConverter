@@ -1,11 +1,25 @@
 @testable import KanaKanjiConverterModule
 import XCTest
 
+/// jinen用プロファイル畳み込みの表テストをまとめる
+///
+/// jinenEvaluationModeがv3のプロファイルを左文脈の先頭へPとSとCの順で畳み込むことを検証する
+///
+/// 実モデルは使わず、ZenzPromptBuilderの生成プロンプト文字列で判定する
 final class ZenzJinenPersonaTests: XCTestCase {
+    /// 検証対象の区切り文字を返す
+    ///
+    /// 製品のjinenPersonaSeparatorと常に一致させ、区切り依存の期待値を組み立てる
     private var separator: String {
         ZenzCandidateEvaluator.jinenPersonaSeparator
     }
 
+    /// 指定した設定の候補評価プロンプトを作る
+    ///
+    /// - Parameters:
+    ///   - config: 畳み込み前または畳み込み後のv3設定
+    ///   - input: プロンプトに載せる入力読み
+    /// - Returns: 畳み込み結果を反映した評価プロンプト文字列
     private func prompt(
         for config: ConvertRequestOptions.ZenzaiVersionDependentMode,
         input: String = "カンジ"
@@ -18,6 +32,13 @@ final class ZenzJinenPersonaTests: XCTestCase {
         )
     }
 
+    /// 検証用のv3設定を作る
+    ///
+    /// - Parameters:
+    ///   - profile: 左文脈の先頭へ畳み込む利用者像
+    ///   - leftSideContext: 畳み込み対象の左文脈
+    ///   - maxLeftSideContextLength: 左文脈の切り詰め上限
+    /// - Returns: 指定した条件を持つv3設定
     private func v3(
         profile: String? = nil,
         leftSideContext: String? = nil,
@@ -32,7 +53,9 @@ final class ZenzJinenPersonaTests: XCTestCase {
         )
     }
 
-    // T1: empty profile is a no-op (mode and prompt identical to jinenAdjustedMode).
+    /// 空のプロファイルが無処理であることを検証する (T1)
+    ///
+    /// プロファイルが空ならjinenEvaluationModeの結果はjinenAdjustedModeと同一になり、生成プロンプトも変わらない
     func testEmptyProfileReturnsAdjustedModeUnchanged() {
         for profile in [nil, "", "  "] as [String?] {
             let config = self.v3(profile: profile, leftSideContext: "今日は")
@@ -55,7 +78,9 @@ final class ZenzJinenPersonaTests: XCTestCase {
         }
     }
 
-    // T2: profile with no left context becomes the whole left context.
+    /// 左文脈が無いときはプロファイル全体が左文脈になることを検証する (T2)
+    ///
+    /// 畳み込み後の左文脈はプロファイルと区切りの結合になる
     func testProfileWithoutLeftContext() {
         let S = self.separator
         XCTAssertEqual(
@@ -64,7 +89,9 @@ final class ZenzJinenPersonaTests: XCTestCase {
         )
     }
 
-    // T3: long left context is trimmed to the same 40 chars, persona is intact.
+    /// 長い左文脈でもプロファイルが保たれることを検証する (T3)
+    ///
+    /// 左文脈は末尾40文字に切り詰められ、プロファイルと区切りは削られない
     func testLongLeftContextKeepsPersonaIntact() {
         let S = self.separator
         let left = String(repeating: "あ", count: 60)
@@ -82,7 +109,9 @@ final class ZenzJinenPersonaTests: XCTestCase {
         }
     }
 
-    // T4: maxLeftSideContextLength bounds C only; 0 leaves P + S.
+    /// 切り詰め上限が左文脈だけを縛ることを検証する (T4)
+    ///
+    /// 上限0では左文脈が消えてプロファイルと区切りだけが残る
     func testMaxLeftSideContextLengthBoundsContextOnly() {
         let S = self.separator
         XCTAssertEqual(
@@ -103,7 +132,9 @@ final class ZenzJinenPersonaTests: XCTestCase {
         )
     }
 
-    // T12: grapheme-boundary left contexts keep P + S and match suffix semantics.
+    /// 書記素境界の左文脈でも切り詰めがsuffixと一致することを検証する (T12)
+    ///
+    /// 結合文字やZWJ絵文字を含む左文脈でもプロファイルと区切りは保たれる
     func testGraphemeBoundaryLeftContext() {
         let S = self.separator
         let combining = String(repeating: "あ", count: 59) + "あ\u{3099}"
@@ -116,7 +147,9 @@ final class ZenzJinenPersonaTests: XCTestCase {
         XCTAssertEqual(zwjResult, "医師" + S + zwj + "カンジ")
     }
 
-    // T5: profile capped at 25 chars; cut-point whitespace is trimmed.
+    /// プロファイルが末尾25文字に切り詰められることを検証する (T5)
+    ///
+    /// 切り口の空白は取り除き、空になる場合は畳み込み自体を行わない
     func testProfileCappedAtTwentyFiveCharacters() {
         let S = self.separator
         XCTAssertEqual(
@@ -131,14 +164,16 @@ final class ZenzJinenPersonaTests: XCTestCase {
         )
     }
 
-    // T6: sentence-final P avoids a doubled separator (only when S is 。).
+    /// 文末記号で終わるプロファイルでは区切りを重ねないことを検証する (T6)
+    ///
+    /// 区切りが句点の場合に限り、既に文末記号で終わるプロファイルの後ろには区切りを足さない
     func testSentenceFinalProfileSkipsSeparator() {
         if self.separator == "。" {
             XCTAssertEqual(
                 self.prompt(for: self.v3(profile: "学生です。")),
                 "学生です。カンジ"
             )
-            // NFKC maps ！ to !, which also counts as sentence-final.
+            // NFKCで全角感嘆符は半角に正規化されるため、文末記号として扱う
             XCTAssertEqual(
                 self.prompt(for: self.v3(profile: "学生です！")),
                 "学生です!カンジ"
@@ -151,14 +186,16 @@ final class ZenzJinenPersonaTests: XCTestCase {
         }
     }
 
-    // T7: NFKC + trim shape P; inner spaces survive.
+    /// プロファイルがNFKC正規化と前後空白除去を受けることを検証する (T7)
+    ///
+    /// 中間空白は残り、1文字が複数文字に広がる場合も正規化後の25文字で切る
     func testProfileNormalization() {
         let S = self.separator
         XCTAssertEqual(
             self.prompt(for: self.v3(profile: "　ＡＢＣ　エンジニア ")),
             "ABC エンジニア" + S + "カンジ"
         )
-        // ㍿ (U+337F) becomes 4 chars under NFKC; 25 in a row cap at 25 NFKC chars.
+        // ㍿はNFKCで4文字に広がるため、25個並べると正規化後の25文字で切れる
         let many = String(repeating: "㍿", count: 25)
         let expectedP = String((many.precomposedStringWithCompatibilityMapping).suffix(25))
         XCTAssertEqual(expectedP.count, 25)
@@ -168,7 +205,9 @@ final class ZenzJinenPersonaTests: XCTestCase {
         )
     }
 
-    // T8: conditions other than profile stay stripped.
+    /// プロファイル以外の条件が除去されたままであることを検証する (T8)
+    ///
+    /// 話題と文体と好みと右文脈と区切り有効化はjinen評価に渡さない
     func testOtherConditionsStayStripped() {
         let mode = ConvertRequestOptions.ZenzaiV3DependentMode(
             profile: "医師",
@@ -191,7 +230,9 @@ final class ZenzJinenPersonaTests: XCTestCase {
         XCTAssertFalse(out.enableAlignmentSeparator)
     }
 
-    // T9: v2 passes through untouched.
+    /// v2設定はそのまま通ることを検証する (T9)
+    ///
+    /// プロファイル畳み込みはv3専用のため、v2には何もしない
     func testV2PassesThrough() {
         let config = ConvertRequestOptions.ZenzaiVersionDependentMode.v2(
             ConvertRequestOptions.ZenzaiV2DependentMode(profile: "医師", leftSideContext: "今日は")
@@ -199,7 +240,9 @@ final class ZenzJinenPersonaTests: XCTestCase {
         XCTAssertEqual(ZenzCandidateEvaluator.jinenEvaluationMode(config), config)
     }
 
-    // T10: jinenAdjustedMode still drops the profile (generator path unchanged).
+    /// 調整済みモードがプロファイルを捨てることを検証する (T10)
+    ///
+    /// 生成側の経路は畳み込み前と同じくプロファイルを持たない
     func testAdjustedModeStillDropsProfile() {
         let config = self.v3(profile: "医師", leftSideContext: "今日は", maxLeftSideContextLength: 5)
         let adjusted = ZenzCandidateEvaluator.jinenAdjustedMode(config)
@@ -212,7 +255,9 @@ final class ZenzJinenPersonaTests: XCTestCase {
         XCTAssertEqual(mode.maxLeftSideContextLength, 5)
     }
 
-    // T11: different profiles give different prompts (cache separation).
+    /// プロファイルが違えばプロンプトも違うことを検証する (T11)
+    ///
+    /// 畳み込み後の左文脈がキーに含まれるため、別プロファイルの結果を共有しない
     func testDifferentProfilesGiveDifferentPrompts() {
         XCTAssertNotEqual(
             self.prompt(for: self.v3(profile: "医師")),

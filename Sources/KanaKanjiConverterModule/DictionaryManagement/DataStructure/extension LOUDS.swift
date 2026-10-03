@@ -99,7 +99,7 @@ extension LOUDS {
     @inlinable
     static func parseBinary(binary: borrowing Data) -> [DicdataElement] {
         // Fast parse without intermediate toArray allocations
-        // 破損・切り詰められたシャードでも読み出しをトラップさせず空で縮退する
+        // 破損や切り詰めで短くなったシャードでも落ちずに空で縮退する
         guard binary.count >= 2 else {
             return []
         }
@@ -143,7 +143,7 @@ extension LOUDS {
                         let rb = UnsafeBufferPointer(start: ptr + startInt, count: length)
                         ruby = String(decoding: rb, as: UTF8.self)
                     } else if i >= dicdata.endIndex {
-                        // 宣言件数より多くの表層フィールドを持つ破損データで添字超過を避ける
+                        // 宣言件数を超える表層フィールドを持つ壊れたデータでは添字超過を避けて打ち切る
                         return
                     } else if isEmptyField {
                         withMutableValue(&dicdata[i]) {
@@ -222,11 +222,19 @@ extension LOUDS {
         }
     }
 
-    /// 学習メモリのシャードから、指定したローカルインデックスの行だけを厳密に読み出す。
+    /// 学習メモリのシャードから指定したローカル番号の行だけを厳密に読み出す
     ///
-    /// `parseLoudstxt3Binary` と違い全オフセットを使用前に検証し、壊れたシャードでは
-    /// 配列境界でトラップせず `malformedShard` を throw する。永続化済み学習エントリの
-    /// 同定に必要なフィールドのみを復号する。
+    /// 全体を読むparseLoudstxt3Binaryとは異なり全ての位置を使用前に検証する
+    ///
+    /// 壊れたシャードでは落ちずにmalformedShardを投げる
+    ///
+    /// 永続化済み学習エントリの同定に要る読みと表記と品詞IDだけを復号する
+    ///
+    /// - Parameters:
+    ///   - binary: シャード全体のバイナリ
+    ///   - localIndices: シャード内での行番号の一覧
+    /// - Returns: 読みと表記と左右の品詞IDの組の一覧
+    /// - Throws: 壊れたシャードの場合はLearningMemoryEnumerationErrorのmalformedShard
     static func parsePersistedMemoryRows(
         binary: borrowing Data,
         localIndices: [Int]
@@ -257,6 +265,15 @@ extension LOUDS {
         return rows
     }
 
+    /// シャード内の1行分の範囲から読みと表記と品詞IDを復号する
+    ///
+    /// 数値部の長さと表層部の項目数が宣言と食い違う範囲は壊れているとみなす
+    ///
+    /// - Parameters:
+    ///   - binary: シャード全体のバイナリ
+    ///   - range: この行が占めるバイト範囲
+    /// - Returns: 読みと表記と左右の品詞IDの組の一覧
+    /// - Throws: 壊れた範囲の場合はLearningMemoryEnumerationErrorのmalformedShard
     private static func parsePersistedMemoryEntry(
         binary: borrowing Data,
         range: Range<Int>
@@ -265,7 +282,7 @@ extension LOUDS {
             throw LearningMemoryEnumerationError.malformedShard
         }
         let rowCount = Int(readUInt16LE(binary, range.lowerBound))
-        // 1行あたり lcid/rcid/mid (UInt16 x3) + score (Float32) の10バイト
+        // 1行は左右の品詞IDと意味IDと評価値で10バイト使う
         let numericBytes = rowCount * 10
         let textStart = range.lowerBound + MemoryLayout<UInt16>.size + numericBytes
         guard textStart <= range.upperBound else {
@@ -294,7 +311,7 @@ extension LOUDS {
     }
 
     private static func parseLoudstxt3Binary(binary: borrowing Data, indices: [Int]) -> [DicdataElement] {
-        // 破損・切り詰められたシャードでも読み出しをトラップさせず空で縮退する
+        // 破損や切り詰めで短くなったシャードでも落ちずに空で縮退する
         guard binary.count >= 2 else {
             return []
         }

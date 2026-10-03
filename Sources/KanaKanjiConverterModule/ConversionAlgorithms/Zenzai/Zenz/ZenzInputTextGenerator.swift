@@ -20,7 +20,8 @@ struct ZenzInputTextGenerator {
         guard count > 0 else {
             return ""
         }
-        // [hazkey-community patch] jinen (Qwen3) は条件トークン (U+EE03-EE06) を学習していない。
+        // [Hazkey Community Patch]
+        // jinen (Qwen3) 系は条件トークン (U+EE03からU+EE06) を学習していないため条件付きモードを調整してからプロンプトを作る
         let effectiveConfig = context.isJinenModel
             ? ZenzCandidateEvaluator.jinenAdjustedMode(versionDependentConfig)
             : versionDependentConfig
@@ -31,7 +32,8 @@ struct ZenzInputTextGenerator {
         ) else {
             return ""
         }
-        // [hazkey-community patch] opt-in Zenzai CPU latency deadline (HAZKEY_ZENZAI_DEADLINE_MS)
+        // [Hazkey Community Patch]
+        // HAZKEY_ZENZAI_DEADLINE_MS設定時のみ有効な推論期限の監視を開始する
         ZenzInferencePerf.shared.beginDeadlineWindow()
         let allowedPrefixes: [String] = possibleNexts.filter { !$0.isEmpty }
 
@@ -46,7 +48,8 @@ struct ZenzInputTextGenerator {
             })
         }
 
-        // [hazkey-community patch] jinen (Qwen3) は BOS (<s>) を付加しない。
+        // [Hazkey Community Patch]
+        // jinen (Qwen3) 系はBOSを付けずに学習されているため符号化時にBOSを付けない
         var promptTokens = context.encode(prompt, addBOS: !context.isJinenModel, addEOS: false)
         let minLength = max(1, min(minLength, count))
         let vocabSize = Int(context.vocabSize)

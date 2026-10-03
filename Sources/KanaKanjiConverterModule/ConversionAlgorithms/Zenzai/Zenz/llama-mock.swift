@@ -14,10 +14,13 @@ package struct llama_context_params {
     package var n_threads: Int32
     package var n_threads_batch: Int32
     package var n_batch: Int
+    /// フラッシュアテンションの種別 (実llama.cppの同名設定に対応するモック)
     package var flash_attn_type: llama_flash_attn_type
     package var no_perf: Bool
 }
+/// フラッシュアテンション種別の型 (実llama.cppの同名型に対応するモック)
 package typealias llama_flash_attn_type = Int32
+/// フラッシュアテンション有効値 (実llama.cppの同名定数に対応するモック)
 package let LLAMA_FLASH_ATTN_TYPE_ENABLED: llama_flash_attn_type = 1
 package func llama_context_default_params() -> llama_context_params { unimplemented() }
 
@@ -39,14 +42,22 @@ package struct llama_model_params {
 package func llama_model_default_params() -> llama_model_params { unimplemented() }
 
 package func llama_model_get_vocab(_: llama_model) -> llama_vocab? { unimplemented() }
+/// モデルのメタデータ文字列を読む (実llama.cppの同名関数に対応するモック)
+///
+/// traitなしビルドでもGGUFのgeneral.architecture判定を含むコードをコンパイルするために用意する
 package func llama_model_meta_val_str(_: llama_model, _: UnsafePointer<CChar>, _: UnsafeMutablePointer<CChar>, _: Int) -> Int32 { unimplemented() }
 
 package func llama_model_load_from_file(_: String, _: llama_model_params) -> llama_model? { unimplemented() }
 
+/// llama.cppのKVキャッシュメモリを指す型 (実llama.cppの同名型に対応するモック)
 package typealias llama_memory_t = OpaquePointer
+/// コンテキストのKVキャッシュメモリを得る (実llama.cppの同名関数に対応するモック)
 package func llama_get_memory(_: llama_context) -> llama_memory_t? { unimplemented() }
+/// 指定範囲のKVキャッシュを消去する (実llama.cppの同名関数に対応するモック)
 package func llama_memory_seq_rm(_: llama_memory_t?, _: llama_seq_id, _: llama_pos, _: llama_pos) {}
+/// シーケンス間でKVキャッシュを複写する (実llama.cppの同名関数に対応するモック)
 package func llama_memory_seq_cp(_: llama_memory_t?, _: llama_seq_id, _: llama_seq_id, _: llama_pos, _: llama_pos) {}
+/// シーケンスのKVキャッシュ最大位置を返す (実llama.cppの同名関数に対応するモック)
 package func llama_memory_seq_pos_max(_: llama_memory_t?, _: llama_seq_id) -> Int { unimplemented() }
 
 package struct llama_batch {
