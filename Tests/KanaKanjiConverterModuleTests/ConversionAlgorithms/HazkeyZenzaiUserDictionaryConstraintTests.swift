@@ -71,16 +71,97 @@ final class HazkeyZenzaiUserDictionaryConstraintTests: XCTestCase {
         XCTAssertEqual(constraint.constraint, Array("今日は".utf8))
     }
 
+    /// 評価で常に受け入れたユーザ辞書の語は、制約へ引き継がない (引き継ぐと以後の文脈で選び直せない)
+    func testUserDictionaryWordInCandidateIsNotCarriedIntoConstraint() {
+        let cache = Self.cache(evaluated: "ゆうきを", elements: [
+            Self.element("結城", "ユウキ", metadata: .isFromUserDictionary),
+            Self.element("を", "ヲ"),
+        ])
+        let constraint = cache.getNewConstraint(for: Self.composingText("ゆうきをだ"), userDictionary: [Self.yuuki])
+        XCTAssertEqual(constraint.constraint, [])
+    }
+
+    /// ユーザ辞書の語より前の表記は制約に残す
+    func testConstraintKeepsWordsBeforeUserDictionaryWordInCandidate() {
+        let cache = Self.cache(evaluated: "きょうはゆうきと", elements: [
+            Self.element("今日", "キョウ"),
+            Self.element("は", "ハ"),
+            Self.element("結城", "ユウキ", metadata: .isFromUserDictionary),
+            Self.element("と", "ト"),
+        ])
+        let constraint = cache.getNewConstraint(for: Self.composingText("きょうはゆうきとあ"), userDictionary: [Self.yuuki])
+        XCTAssertEqual(constraint.constraint, Array("今日は".utf8))
+    }
+
+    /// 学習語はモデルが評価し直せるので、従来どおり制約に残す
+    func testLearnedWordInCandidateIsStillCarriedIntoConstraint() {
+        let cache = Self.cache(evaluated: "ゆうきを", elements: [
+            Self.element("結城", "ユウキ", metadata: .isLearned),
+            Self.element("を", "ヲ"),
+        ])
+        let constraint = cache.getNewConstraint(for: Self.composingText("ゆうきをだ"), userDictionary: [])
+        XCTAssertEqual(constraint.constraint, Array("結城を".utf8))
+    }
+
+    /// 候補を持たない制約は、評価済みの読みの中で揃っていたユーザ辞書の語の表記を含み得るので捨てる
+    func testRawConstraintWithUserDictionaryWordInsideEvaluatedReadingIsDropped() {
+        let cache = Kana2Kanji.ZenzaiCache(
+            Self.composingText("ゆうきを"),
+            constraint: Kana2Kanji.PrefixConstraint(Array("結城を".utf8)),
+            satisfyingCandidate: nil
+        )
+        let constraint = cache.getNewConstraint(for: Self.composingText("ゆうきをだ"), userDictionary: [Self.yuuki])
+        XCTAssertEqual(constraint.constraint, [])
+    }
+
+    /// 明示的に受け入れた先頭候補は、ユーザ辞書の語を含んでも固定部分として残す
+    func testAcceptedPrefixWithUserDictionaryWordIsKeptAsFixedPrefix() {
+        let candidate = Self.candidate(evaluated: "ゆうきを", elements: [
+            Self.element("結城", "ユウキ", metadata: .isFromUserDictionary),
+            Self.element("を", "ヲ"),
+        ])
+        let accepted = Self.cache(evaluated: "ゆうきを", candidate: candidate).settingPrefixCandidate(candidate)
+        let expectedFixedPrefix = Kana2Kanji.PrefixConstraint.FixedPrefix(byteCount: "結城を".utf8.count, rubyCount: 4)
+        for cache in [accepted, accepted.keepingOnlyAcceptedPrefix()] {
+            let constraint = cache.getNewConstraint(for: Self.composingText("ゆうきをだ"), userDictionary: [Self.yuuki])
+            XCTAssertEqual(constraint.constraint, Array("結城を".utf8))
+            XCTAssertEqual(constraint.fixedPrefix, expectedFixedPrefix)
+        }
+    }
+
+    private static let yuuki = DicdataElement(
+        word: "結城",
+        ruby: "ユウキ",
+        cid: CIDData.固有名詞.cid,
+        mid: 100,
+        value: -5,
+        metadata: .isFromUserDictionary
+    )
+
+    private static func element(_ word: String, _ ruby: String, metadata: DicdataElementMetadata = .empty) -> DicdataElement {
+        DicdataElement(word: word, ruby: ruby, cid: CIDData.一般名詞.cid, mid: 100, value: -10, metadata: metadata)
+    }
+
     private static func cache(evaluated reading: String, candidate items: [(word: String, ruby: String)]) -> Kana2Kanji.ZenzaiCache {
-        let data = items.map { DicdataElement(word: $0.word, ruby: $0.ruby, cid: CIDData.一般名詞.cid, mid: 100, value: -10) }
-        let candidate = Candidate(
-            text: items.map(\.word).joined(),
+        Self.cache(evaluated: reading, elements: items.map { Self.element($0.word, $0.ruby) })
+    }
+
+    private static func cache(evaluated reading: String, elements data: [DicdataElement]) -> Kana2Kanji.ZenzaiCache {
+        Self.cache(evaluated: reading, candidate: Self.candidate(evaluated: reading, elements: data))
+    }
+
+    private static func candidate(evaluated reading: String, elements data: [DicdataElement]) -> Candidate {
+        Candidate(
+            text: data.map(\.word).joined(),
             value: -20,
             composingCount: .inputCount(reading.count),
             lastMid: 100,
             data: data
         )
-        return Kana2Kanji.ZenzaiCache(
+    }
+
+    private static func cache(evaluated reading: String, candidate: Candidate) -> Kana2Kanji.ZenzaiCache {
+        Kana2Kanji.ZenzaiCache(
             Self.composingText(reading),
             constraint: Kana2Kanji.PrefixConstraint(Array(candidate.text.utf8)),
             satisfyingCandidate: candidate

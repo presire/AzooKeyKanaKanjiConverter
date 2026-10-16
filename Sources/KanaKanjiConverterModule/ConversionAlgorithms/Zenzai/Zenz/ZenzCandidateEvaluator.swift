@@ -24,6 +24,35 @@ struct ZenzEvaluationCacheKey: Sendable, Equatable, Hashable {
         var word: String
         var ruby: String
         var isLearned: Bool
+        // [Hazkey Community Patch]
+        // ユーザ辞書の語の範囲のトークンは評価で常に受け入れるため、評価結果はこのフラグに依存する
+        // jinenは辞書をプロンプトに入れないので、プロンプトだけではユーザ辞書の語を区別できない
+        var isFromUserDictionary: Bool
+        // [Hazkey Community Patch]
+        // 要求で保護を指定された学習語も評価で常に受け入れるため、評価結果はこのフラグにも依存する
+        var isProtectedLearnedWord: Bool
+
+        init(word: String, ruby: String, isLearned: Bool, isFromUserDictionary: Bool = false, isProtectedLearnedWord: Bool = false) {
+            self.word = word
+            self.ruby = ruby
+            self.isLearned = isLearned
+            self.isFromUserDictionary = isFromUserDictionary
+            self.isProtectedLearnedWord = isProtectedLearnedWord
+        }
+
+        init(_ element: DicdataElement) {
+            self.init(element, protection: Kana2Kanji.ZenzaiWordProtection())
+        }
+
+        init(_ element: DicdataElement, protection: Kana2Kanji.ZenzaiWordProtection) {
+            self.init(
+                word: element.word,
+                ruby: element.ruby,
+                isLearned: element.metadata.contains(.isLearned),
+                isFromUserDictionary: element.metadata.contains(.isFromUserDictionary),
+                isProtectedLearnedWord: protection.protectsLearnedWord(element)
+            )
+        }
     }
 
     var prompt: String
@@ -87,7 +116,8 @@ struct ZenzCandidateEvaluator {
         prefixConstraint: Kana2Kanji.PrefixConstraint,
         personalizationMode: (mode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode, base: EfficientNGram, personal: EfficientNGram)?,
         versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
-        memoizationCache: ZenzaiMemoizationCache
+        memoizationCache: ZenzaiMemoizationCache,
+        wordProtection: Kana2Kanji.ZenzaiWordProtection = Kana2Kanji.ZenzaiWordProtection()
     ) -> CandidateEvaluationResult {
         // 固定された部分は、表記を左文脈に移し、読みを入力から除いて、残りだけを評価する。
         // モデルは固定された表記が読みを消費したことを知らないので、残したまま評価すると続きの判断がずれる。
@@ -103,7 +133,8 @@ struct ZenzCandidateEvaluator {
                 prefixConstraint: prefixConstraint,
                 personalizationMode: personalizationMode,
                 versionDependentConfig: versionDependentConfig,
-                memoizationCache: memoizationCache
+                memoizationCache: memoizationCache,
+                wordProtection: wordProtection
             )
         }
         let fixed = Array(prefixConstraint.constraint.prefix(fixedPrefix.byteCount))
@@ -122,7 +153,8 @@ struct ZenzCandidateEvaluator {
             prefixConstraint: remainingConstraint,
             personalizationMode: personalizationMode,
             versionDependentConfig: self.appendingLeftSideContext(String(decoding: fixed, as: UTF8.self), to: versionDependentConfig),
-            memoizationCache: memoizationCache
+            memoizationCache: memoizationCache,
+            wordProtection: wordProtection
         )
         return self.prepending(fixed, to: result)
     }
@@ -136,7 +168,8 @@ struct ZenzCandidateEvaluator {
         prefixConstraint: Kana2Kanji.PrefixConstraint,
         personalizationMode: (mode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode, base: EfficientNGram, personal: EfficientNGram)?,
         versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
-        memoizationCache: ZenzaiMemoizationCache
+        memoizationCache: ZenzaiMemoizationCache,
+        wordProtection: Kana2Kanji.ZenzaiWordProtection = Kana2Kanji.ZenzaiWordProtection()
     ) -> CandidateEvaluationResult {
         debug("Evaluate", candidate)
         var userDictionaryPrompt = ""
@@ -181,13 +214,7 @@ struct ZenzCandidateEvaluator {
                 prefixConstraint: prefixConstraint,
                 requestRichCandidates: requestRichCandidates,
                 reusesAddressedPrefix: reusesAddressedPrefix,
-                candidateSegments: candidate.data.map {
-                    .init(
-                        word: $0.word,
-                        ruby: $0.ruby,
-                        isLearned: $0.metadata.contains(.isLearned)
-                    )
-                }
+                candidateSegments: candidate.data.map { ZenzEvaluationCacheKey.CandidateSegment($0, protection: wordProtection) }
             )
         } else {
             nil
@@ -244,6 +271,20 @@ struct ZenzCandidateEvaluator {
             }
         } else {
             learnedTokenPriorities = nil
+        }
+        // [Hazkey Community Patch]
+        // ユーザ辞書の語の範囲に収まる候補のトークン。位置は実際の candidateTokens の復号結果で決める
+        // 要求で指定された学習語も、ユーザ辞書の語と同じく保護する (Kana2Kanji.ZenzaiWordProtection)
+        let userDictionaryProtection: UserDictionaryProtection? = if candidate.data.contains(where: wordProtection.protects) {
+            Self.userDictionaryProtection(
+                candidateText: candidate.text,
+                data: candidate.data,
+                candidateTokenPieces: candidateTokens.map { context.tokenToPiece(token: $0).map { UInt8(bitPattern: $0) } },
+                normalize: context.normalizeForModel,
+                isProtected: wordProtection.protects
+            )
+        } else {
+            nil
         }
 
         var score: Float = 0
@@ -392,42 +433,56 @@ struct ZenzCandidateEvaluator {
                 }
                 vocabScanNanoseconds &+= ZenzInferencePerf.shared.elapsed(since: vocabScanStartedAt)
 
-                if maxItem.token != tokenID {
-                    if maxItem.token == context.eosToken {
-                        let data = Data(decodeCandidatePieces(upTo: i))
-                        let wholeResult = String(data: data, encoding: .utf8) ?? ""
-                        return finish(.wholeResult(wholeResult))
-                    } else {
-                        let candidateTokenIndex = i - promptTokens.count
-                        let learnedPriority = learnedTokenPriorities.map {
-                            candidateTokenIndex < $0.count ? $0[candidateTokenIndex] : 0
-                        } ?? 0
-                        // softmaxの正規化項は両辺で相殺されるため、logitのまま比較できる。
-                        let preferLearnedToken = learnedPriority > 0
-                            && logits[startIndex + Int(tokenID)] + learnedPriority > maxItem.logit
-                        if !preferLearnedToken {
-                            let bytes = decodeCandidatePieces(upTo: i)
-                                + context.tokenToPiece(token: maxItem.token).map { UInt8(bitPattern: $0) }
-                            return finish(
-                                .fixRequired(
-                                    prefixConstraint: bytes
+                // [Hazkey Community Patch]
+                // トークンの判定は candidateTokenDecision(...) にまとめ、ユーザ辞書の語の範囲のトークンは常に受け入れる
+                let candidateTokenIndex = i - promptTokens.count
+                let learnedPriority = learnedTokenPriorities.map {
+                    candidateTokenIndex < $0.count ? $0[candidateTokenIndex] : 0
+                } ?? 0
+                let isUserDictionaryToken = userDictionaryProtection.map {
+                    candidateTokenIndex < $0.tokenMask.count && $0.tokenMask[candidateTokenIndex]
+                } ?? false
+                // 返す制約では、ユーザ辞書の語の範囲を元の表記へ戻す
+                func constraintPrefix() -> [UInt8] {
+                    let decoded = decodeCandidatePieces(upTo: i)
+                    return userDictionaryProtection?.restoringSurface(decoded) ?? decoded
+                }
+                switch Self.candidateTokenDecision(
+                    candidateToken: tokenID,
+                    candidateLogit: logits[startIndex + Int(tokenID)],
+                    maxToken: maxItem.token,
+                    maxLogit: maxItem.logit,
+                    eosToken: context.eosToken,
+                    learnedPriority: learnedPriority,
+                    isUserDictionaryToken: isUserDictionaryToken
+                ) {
+                case .wholeResult:
+                    let data = Data(constraintPrefix())
+                    let wholeResult = String(data: data, encoding: .utf8) ?? ""
+                    return finish(.wholeResult(wholeResult))
+                case .fixRequired:
+                    let bytes = constraintPrefix()
+                        + context.tokenToPiece(token: maxItem.token).map { UInt8(bitPattern: $0) }
+                    return finish(
+                        .fixRequired(
+                            prefixConstraint: bytes
+                        )
+                    )
+                case .accept(let collectsAlternatives):
+                    if collectsAlternatives && requestRichCandidates {
+                        tokenHeap.removeMax()
+                        let prefix = constraintPrefix()
+
+                        for item in tokenHeap.unordered {
+                            altTokens.insertIfPossible(
+                                AlternativeHighProbToken(
+                                    token: item.token,
+                                    constraint: prefix
+                                        + context.tokenToPiece(token: item.token).map { UInt8(bitPattern: $0) },
+                                    probabilityRatioToMaxProb: expf(item.logit - maxItem.logit)
                                 )
                             )
                         }
-                    }
-                } else if requestRichCandidates {
-                    tokenHeap.removeMax()
-                    let prefix = decodeCandidatePieces(upTo: i)
-
-                    for item in tokenHeap.unordered {
-                        altTokens.insertIfPossible(
-                            AlternativeHighProbToken(
-                                token: item.token,
-                                constraint: prefix
-                                    + context.tokenToPiece(token: item.token).map { UInt8(bitPattern: $0) },
-                                probabilityRatioToMaxProb: expf(item.logit - maxItem.logit)
-                            )
-                        )
                     }
                 }
                 // この値は順位付けには使われない。正規化項の全語彙走査を避けるため、
@@ -620,6 +675,145 @@ struct ZenzCandidateEvaluator {
         case .wholeResult(let wholeResult):
             return .wholeResult(String(decoding: fixed, as: UTF8.self) + wholeResult)
         }
+    }
+
+    // [Hazkey Community Patch]
+    // 候補のトークン1つの判定。evaluateAsIs(...) のループから切り出し、モデルなしで検証できるようにする
+    enum CandidateTokenDecision: Equatable {
+        /// 候補のトークンを受け入れる。`collectsAlternatives` はリッチな候補の代替の制約を集めてよいか
+        case accept(collectsAlternatives: Bool)
+        case wholeResult
+        case fixRequired
+    }
+
+    static func candidateTokenDecision(
+        candidateToken: llama_token,
+        candidateLogit: Float,
+        maxToken: llama_token,
+        maxLogit: Float,
+        eosToken: llama_token,
+        learnedPriority: Float,
+        isUserDictionaryToken: Bool
+    ) -> CandidateTokenDecision {
+        // 保護対象のトークン (ユーザ辞書の語の範囲に完全に収まるトークン) は、モデルが別のトークンや文末記号を選んでも受け入れる
+        // 代替の制約は保護した範囲を別の表記へ変えるため集めない
+        if isUserDictionaryToken {
+            return .accept(collectsAlternatives: false)
+        }
+        if maxToken == candidateToken {
+            return .accept(collectsAlternatives: true)
+        }
+        if maxToken == eosToken {
+            return .wholeResult
+        }
+        // softmaxの正規化項は両辺で相殺されるため、logitのまま比較できる。
+        if learnedPriority > 0 && candidateLogit + learnedPriority > maxLogit {
+            return .accept(collectsAlternatives: false)
+        }
+        return .fixRequired
+    }
+
+    /// 候補の中のユーザ辞書の語の範囲
+    struct UserDictionaryProtection: Equatable {
+        var tokenMask: [Bool]
+        /// モデル用に正規化した表記での範囲と、その範囲の元の表記
+        var surfaceRanges: [SurfaceRange]
+
+        struct SurfaceRange: Equatable {
+            var normalized: Range<Int>
+            var surface: [UInt8]
+        }
+
+        /// 候補のトークンを復号した列のうち、完全に含まれるユーザ辞書の語の範囲を元の表記へ戻す
+        ///
+        /// 返す制約はラティスの語の表記と照合されるため、正規化で表記が変わる語 (jinenのNFKC、zenzの空白) は元の表記でないと一致しない
+        func restoringSurface(_ decoded: [UInt8]) -> [UInt8] {
+            var restored: [UInt8] = []
+            var copiedEnd = 0
+            for range in self.surfaceRanges where range.normalized.upperBound <= decoded.count {
+                restored.append(contentsOf: decoded[copiedEnd ..< range.normalized.lowerBound])
+                restored.append(contentsOf: range.surface)
+                copiedEnd = range.normalized.upperBound
+            }
+            restored.append(contentsOf: decoded[copiedEnd...])
+            return restored
+        }
+    }
+
+    static func userDictionaryProtection(
+        candidateText: String,
+        data: [DicdataElement],
+        candidateTokenPieces: [[UInt8]],
+        normalize: (String) -> String,
+        isProtected: (DicdataElement) -> Bool = { $0.metadata.contains(.isFromUserDictionary) }
+    ) -> UserDictionaryProtection? {
+        guard data.contains(where: isProtected) else {
+            return nil
+        }
+        // 固定された表記を除いた候補では、dataの先頭の語が固定部分を含むことがある
+        let joinedWords = Array(data.map(\.word).joined().utf8)
+        let textBytes = Array(candidateText.utf8)
+        guard joinedWords.count >= textBytes.count,
+              joinedWords.suffix(textBytes.count).elementsEqual(textBytes) else {
+            return nil
+        }
+        let leadingDropCount = joinedWords.count - textBytes.count
+
+        let concatenatedPieces = candidateTokenPieces.flatMap { $0 }
+        guard concatenatedPieces.starts(with: normalize(candidateText).utf8) else {
+            return nil
+        }
+        // 候補の表記のバイト位置を、モデル用に正規化して符号化した列のバイト位置へ移す
+        // 書記素の途中や、正規化が前後の語をまたぐ位置は対応させられないので、その範囲を保護対象から外す
+        func normalizedOffset(ofTextByteOffset offset: Int) -> Int? {
+            let utf8Index = candidateText.utf8.index(candidateText.utf8.startIndex, offsetBy: offset)
+            guard let index = String.Index(utf8Index, within: candidateText) else {
+                return nil
+            }
+            let normalizedPrefix = normalize(String(candidateText[..<index])).utf8
+            guard concatenatedPieces.starts(with: normalizedPrefix) else {
+                return nil
+            }
+            return normalizedPrefix.count
+        }
+
+        // 連続するユーザ辞書の語は1つの範囲にまとめ、語の間をまたぐトークンも保護する
+        var protectedRanges: [UserDictionaryProtection.SurfaceRange] = []
+        func appendProtectedRange(textByteRange: Range<Int>) {
+            if let lower = normalizedOffset(ofTextByteOffset: textByteRange.lowerBound),
+               let upper = normalizedOffset(ofTextByteOffset: textByteRange.upperBound),
+               lower < upper {
+                protectedRanges.append(.init(normalized: lower ..< upper, surface: Array(textBytes[textByteRange])))
+            }
+        }
+        var runStart: Int?
+        var wordEnd = 0
+        for element in data {
+            let wordStart = max(0, wordEnd - leadingDropCount)
+            wordEnd += element.word.utf8.count
+            let clampedEnd = max(0, wordEnd - leadingDropCount)
+            if isProtected(element) {
+                if runStart == nil, clampedEnd > wordStart {
+                    runStart = wordStart
+                }
+            } else if let start = runStart {
+                runStart = nil
+                appendProtectedRange(textByteRange: start ..< wordStart)
+            }
+        }
+        if let start = runStart {
+            appendProtectedRange(textByteRange: start ..< textBytes.count)
+        }
+
+        var pieceStart = 0
+        let tokenMask = candidateTokenPieces.map { piece in
+            let pieceRange = pieceStart ..< pieceStart + piece.count
+            pieceStart += piece.count
+            return !piece.isEmpty && protectedRanges.contains {
+                $0.normalized.lowerBound <= pieceRange.lowerBound && pieceRange.upperBound <= $0.normalized.upperBound
+            }
+        }
+        return UserDictionaryProtection(tokenMask: tokenMask, surfaceRanges: protectedRanges)
     }
 
     private static func learningPriority(data: DicdataElement) -> Float {

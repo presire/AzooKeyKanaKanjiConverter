@@ -116,7 +116,10 @@ extension Kana2Kanji {
         let constraintBytes = constraint.constraint
         let constraintLength = constraintBytes.count
         let fixedByteCount = constraint.fixedPrefix?.byteCount ?? 0
-        let enforcesConstraintOnStaticDictionary = !constraint.ignoreMemoryAndUserDictionary
+        // [Hazkey Community Patch]
+        // 学習語の制約免除を外して再試行するとき (ignoreMemoryAndUserDictionary) は学習語にも制約をかける。ユーザ辞書の語は従来どおりモデル由来の制約を免除する (固定表記は掛ける)。
+        // 上流は再試行で全ノードの制約を外しており、同じ学習語が再び選ばれていた。
+        let constraintExemptMetadata: DicdataElementMetadata = constraint.ignoreMemoryAndUserDictionary ? [.isFromUserDictionary] : [.isLearned, .isFromUserDictionary]
         // 「i文字目から始まるnodes」に対して
         for (isHead, nodeArray) in lattice.indexedNodes(indices: latticeIndices) {
             // それぞれのnodeに対して
@@ -138,8 +141,7 @@ extension Kana2Kanji {
                         constraintBytes: constraintBytes
                     )
                     if nextIndex.surfaceIndex == surfaceCount {
-                        if enforcesConstraintOnStaticDictionary,
-                           node.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
+                        if node.data.metadata.isDisjoint(with: constraintExemptMetadata) {
                             let condition = if constraint.hasEOS {
                                 matchState.matched == constraintLength
                                     && matchState.total == constraintLength
@@ -157,13 +159,11 @@ extension Kana2Kanji {
                             value: value,
                             constraintState: matchState
                         )
-                        if let current = result.prevs.first {
-                            if newNode.totalValue > current.totalValue {
-                                result.prevs[0] = newNode
-                            }
-                        } else {
-                            result.prevs.append(newNode)
-                        }
+                        // [Hazkey Community Patch]
+                        // 文末に達した経路は全て登録し、最良候補は呼び出し側 (all_zenzai) が候補の評価値で選ぶ
+                        // 評価値は意味連接のコストを含み、累積値 (totalValue) と順位が入れ替わり得る
+                        // 累積値が最大の1本だけを残すと、ユーザ辞書の語などで N_best: 3 と異なる候補が選ばれていた
+                        result.prevs.append(newNode)
                         continue
                     }
 
@@ -174,8 +174,7 @@ extension Kana2Kanji {
                            current.totalValue >= newValue {
                             continue
                         }
-                        if enforcesConstraintOnStaticDictionary,
-                           nextNode.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
+                        if nextNode.data.metadata.isDisjoint(with: constraintExemptMetadata) {
                             guard matchState.matched
                                 == min(matchState.total, constraintLength) else {
                                 continue
@@ -190,8 +189,10 @@ extension Kana2Kanji {
                                 continue
                             }
                             let newTotal = matchState.total + nextLength
+                            // [Hazkey Community Patch] 末尾ノードでは制約との完全一致を許す。末尾でない経路は厳密なprefixのままにする。
+                            let isFinalNextNode = indexMap.dualIndex(for: nextNode.range.endIndex).surfaceIndex == surfaceCount
                             let isCompatible = if constraint.hasEOS {
-                                matched == newTotal && newTotal < constraintLength
+                                matched == newTotal && (newTotal < constraintLength || (newTotal == constraintLength && isFinalNextNode))
                             } else {
                                 matched == constraintLength
                                     || (newTotal <= constraintLength && matched == newTotal)
@@ -241,9 +242,8 @@ extension Kana2Kanji {
                         self.computeMatchedAndTotalLength(prev: node.prevs[idx], currentWord: node.data.word, constraintBytes: constraintBytes)
                     }
                     for index in node.prevs.indices {
-                        // 学習データやユーザ辞書由来の場合は素通しする
-                        if enforcesConstraintOnStaticDictionary,
-                           node.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
+                        // メタ情報が制約免除対象と重なる語はモデル制約を掛けない (ユーザ辞書の語は常に免除、学習語はignoreMemoryAndUserDictionaryが偽のときだけ免除)。ただし、固定表記は免除の語にも掛ける。
+                        if node.data.metadata.isDisjoint(with: constraintExemptMetadata) {
                             let (matched, total) = mtPerPrev[index]
                             // 最終チェック（EOS時の条件に合わせる）
                             let condition = if constraint.hasEOS {
@@ -297,9 +297,8 @@ extension Kana2Kanji {
                             // 制約 AB 単語 ABC (OK)
                             // 制約 AB 単語 A   (OK)
                             // 制約 AB 単語 AC  (NG)
-                            // ただし、学習データやユーザ辞書由来の場合は素通しする
-                            if enforcesConstraintOnStaticDictionary,
-                               nextnode.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
+                            // メタ情報が制約免除対象と重なる語はモデル制約を掛けない (ユーザ辞書の語は常に免除、学習語はignoreMemoryAndUserDictionaryが偽のときだけ免除)。ただし、固定表記は免除の語にも掛ける。
+                            if nextnode.data.metadata.isDisjoint(with: constraintExemptMetadata) {
                                 let (matchedPrev, totalPrev) = mtPerPrev[index]
                                 // ensure no prior mismatch
                                 guard matchedPrev == min(totalPrev, constraintLength) else {
@@ -312,9 +311,11 @@ extension Kana2Kanji {
                                     continue
                                 }
                                 let newTotal = totalPrev + nextLen
+                                // [Hazkey Community Patch] 末尾ノードでは制約との完全一致を許す。末尾でない経路は厳密なprefixのままにする。
+                                let isFinalNextNode = indexMap.dualIndex(for: nextnode.range.endIndex).surfaceIndex == surfaceCount
                                 let ok: Bool = if constraint.hasEOS {
-                                    // require strict prefix of constraint
-                                    matchedExt == newTotal && newTotal < constraintLength
+                                    // require strict prefix of constraint, except for the final node reaching EOS
+                                    matchedExt == newTotal && (newTotal < constraintLength || (newTotal == constraintLength && isFinalNextNode))
                                 } else {
                                     // accept either: constraint is prefix of candidate, or candidate is prefix of constraint
                                     (matchedExt == constraintLength)

@@ -634,7 +634,11 @@ public final class DicdataStore {
             let result = state.learningMemoryManager.movingTowardPrefixSearchOnTemporaryMemory(charIDs: consume charIDs)
             updated = updated || !(result.dicdata.isEmpty)
             availableMaxIndex = max(availableMaxIndex, result.availableMaxIndex)
-            for (depth, dicdata) in result.dicdata {
+            for (offset, dicdata) in result.dicdata {
+                // [Hazkey Community Patch]
+                // 一時学習の木は0始まりの終端位置 (語の長さ - 1) をキーに返すため、動的ユーザ辞書と同じ語の長さへ直す
+                // 終端位置のままだと、差分変換で最後に打った文字で終わる語が末尾の絞り込み (minCount) で落ちていた
+                let depth = offset + 1
                 for data in dicdata {
                     if info.penalty.isZero {
                         dynamicDicdata[depth, default: []].append(data)

@@ -144,7 +144,8 @@ package final class Zenz {
         prefixConstraint: Kana2Kanji.PrefixConstraint,
         personalizationMode: (mode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode, base: EfficientNGram, personal: EfficientNGram)?,
         versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
-        memoizationCache: ZenzaiMemoizationCache
+        memoizationCache: ZenzaiMemoizationCache,
+        wordProtection: Kana2Kanji.ZenzaiWordProtection = Kana2Kanji.ZenzaiWordProtection()
     ) -> CandidateEvaluationResult {
         self.inferenceLock.withLock {
             guard let zenzContext else {
@@ -160,7 +161,8 @@ package final class Zenz {
                     prefixConstraint: prefixConstraint,
                     personalizationMode: personalizationMode,
                     versionDependentConfig: versionDependentConfig,
-                    memoizationCache: memoizationCache
+                    memoizationCache: memoizationCache,
+                    wordProtection: wordProtection
                 )
             }
             return .error

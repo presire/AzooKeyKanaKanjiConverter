@@ -1429,7 +1429,8 @@ public final class KanaKanjiConverter {
                 requestRichCandidates: zenzaiMode.requestRichCandidates,
                 personalizationMode: self.getZenzaiPersonalization(mode: zenzaiMode.personalizationMode),
                 versionDependentConfig: zenzaiMode.versionDependentMode,
-                dicdataStoreState: self.dicdataStoreState
+                dicdataStoreState: self.dicdataStoreState,
+                wordProtection: Kana2Kanji.ZenzaiWordProtection(learnedWords: zenzaiMode.protectedLearnedWords)
             )
             self.updateCurrentSessionState {
                 // [Hazkey Community Patch]

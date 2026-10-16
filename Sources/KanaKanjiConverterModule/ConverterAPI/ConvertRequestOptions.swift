@@ -289,5 +289,24 @@ public struct ConvertRequestOptions: Sendable {
         var versionDependentMode: ZenzaiVersionDependentMode
         /// GGMLバックエンドデバイスの構成
         var deviceConfig: DeviceConfig
+
+        // [Hazkey Community Patch]
+        /// Zenzaiの評価で、ユーザ辞書の語と同じく保護する学習語 (読みはカタカナ、表記はラティスの語と同じもの)
+        ///
+        /// 学習語 (`.isLearned`) のうち読みと表記が一致するものだけを、この要求の間、評価で常に受け入れ、
+        /// 学習語の制約を外す再試行へ送らず、次の打鍵の制約へ引き継がない。
+        /// 呼び出し側は、語を選び直した文脈と同じ文脈の要求にだけ渡すこと (全ての要求に渡すと、別の文脈でも語が固定される)。
+        public var protectedLearnedWords: Set<ProtectedLearnedWord> = []
+
+        // [Hazkey Community Patch]
+        public struct ProtectedLearnedWord: Sendable, Hashable {
+            public init(ruby: String, word: String) {
+                self.ruby = ruby
+                self.word = word
+            }
+
+            public var ruby: String
+            public var word: String
+        }
     }
 }

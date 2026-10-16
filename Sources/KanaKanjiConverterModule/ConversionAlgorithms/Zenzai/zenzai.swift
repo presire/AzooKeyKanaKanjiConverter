@@ -29,7 +29,8 @@ extension Kana2Kanji {
             evaluatedSatisfyingCandidate: Candidate?,
             prefixCandidate: Candidate?,
             cachedLattice: Lattice?,
-            cachedLatticeInputData: ComposingText?
+            cachedLatticeInputData: ComposingText?,
+            wordProtection: ZenzaiWordProtection
         ) {
             self.inputData = inputData
             self.prefixConstraint = constraint
@@ -38,6 +39,7 @@ extension Kana2Kanji {
             self.prefixCandidate = prefixCandidate
             self.cachedLattice = cachedLattice
             self.cachedLatticeInputData = cachedLatticeInputData
+            self.wordProtection = wordProtection
         }
 
         private var prefixConstraint: PrefixConstraint
@@ -48,6 +50,10 @@ extension Kana2Kanji {
         private var inputData: ComposingText
         private var cachedLattice: Lattice?
         private var cachedLatticeInputData: ComposingText?
+        // [Hazkey Community Patch]
+        // このキャッシュの制約と確定候補を作った要求で保護した学習語
+        // 保護した語は評価せずに合格させ得るため、保護が異なる要求へ制約を引き継いではならない
+        var wordProtection = ZenzaiWordProtection()
 
         /// 共有済みの変換結果を使う場合、現在の制約だけを更新し、直近の完全な
         /// ラティスは次の未キャッシュ入力の差分構築用アンカーとして保持する。
@@ -63,7 +69,8 @@ extension Kana2Kanji {
                 evaluatedSatisfyingCandidate: satisfyingCandidate,
                 prefixCandidate: self.prefixCandidate(remainingIn: newInputData),
                 cachedLattice: self.cachedLattice,
-                cachedLatticeInputData: self.cachedLatticeInputData
+                cachedLatticeInputData: self.cachedLatticeInputData,
+                wordProtection: self.wordProtection
             )
         }
 
@@ -77,7 +84,8 @@ extension Kana2Kanji {
                 evaluatedSatisfyingCandidate: candidate,
                 prefixCandidate: candidate,
                 cachedLattice: self.cachedLattice,
-                cachedLatticeInputData: self.cachedLatticeInputData
+                cachedLatticeInputData: self.cachedLatticeInputData,
+                wordProtection: self.wordProtection
             )
         }
 
@@ -94,12 +102,25 @@ extension Kana2Kanji {
                 evaluatedSatisfyingCandidate: nil,
                 prefixCandidate: self.prefixCandidate,
                 cachedLattice: nil,
-                cachedLatticeInputData: nil
+                cachedLatticeInputData: nil,
+                wordProtection: self.wordProtection
             )
         }
 
-        func getNewConstraint(for newInputData: ComposingText, userDictionary: [DicdataElement]) -> PrefixConstraint {
-            self.fixingPrefix(self.getReplaceableConstraint(for: newInputData, userDictionary: userDictionary), for: newInputData)
+        // [Hazkey Community Patch]
+        /// 今回の要求で保護する学習語に合わせたキャッシュを返す
+        ///
+        /// 保護が前回と異なる場合は、明示的に受け入れた先頭候補だけを残す (`keepingOnlyAcceptedPrefix()`)
+        /// 前回だけ保護した語を含む制約を引き継ぐと、その語が評価されずに合格し得るため
+        func adoptingWordProtection(_ protection: ZenzaiWordProtection) -> ZenzaiCache {
+            guard self.wordProtection != protection else { return self }
+            var cache = self.keepingOnlyAcceptedPrefix()
+            cache.wordProtection = protection
+            return cache
+        }
+
+        func getNewConstraint(for newInputData: ComposingText, userDictionary: [DicdataElement], protection: ZenzaiWordProtection = ZenzaiWordProtection()) -> PrefixConstraint {
+            self.fixingPrefix(self.getReplaceableConstraint(for: newInputData, userDictionary: userDictionary, protection: protection), for: newInputData)
         }
 
         /// 先頭の候補の読みが入力の先頭にそのまま残っていればその候補。残っていなければ nil で、以降は引き継がない。
@@ -131,8 +152,11 @@ extension Kana2Kanji {
         }
 
         /// モデルの評価で置き換わりうる制約。
-        private func getReplaceableConstraint(for newInputData: ComposingText, userDictionary: [DicdataElement]) -> PrefixConstraint {
+        private func getReplaceableConstraint(for newInputData: ComposingText, userDictionary: [DicdataElement], protection: ZenzaiWordProtection) -> PrefixConstraint {
             let newReading = Array(newInputData.convertTarget.toKatakana())
+            // [Hazkey Community Patch]
+            // 保護する学習語も、ユーザ辞書の語と同じく制約へ引き継がない
+            let userDictionary = userDictionary + protection.learnedWordElements
             if let satisfyingCandidate {
                 let evaluatedReading = satisfyingCandidate.data.map(\.ruby).joined()
                 let cutoff = Self.userDictionaryWordStart(
@@ -145,6 +169,13 @@ extension Kana2Kanji {
                 var constraint = [UInt8]()
                 for item in satisfyingCandidate.data {
                     if current.starts(with: item.ruby) {
+                        // [Hazkey Community Patch]
+                        // ユーザ辞書の語の範囲のトークンは評価で常に受け入れる (ZenzCandidateEvaluator.candidateTokenDecision) ため、
+                        // 制約に引き継ぐと、語が以後の入力の制約として固定され得る
+                        // 語の手前までを制約に残し、語を選ぶかは入力ごとにラティスへ任せる
+                        if protection.protects(item) {
+                            break
+                        }
                         if let cutoff, consumedCount + item.ruby.count > cutoff {
                             break
                         }
@@ -156,7 +187,10 @@ extension Kana2Kanji {
                 return PrefixConstraint(constraint)
             } else if newInputData.convertTarget.hasPrefix(inputData.convertTarget) {
                 let evaluatedCount = inputData.convertTarget.count
-                if let cutoff = Self.userDictionaryWordStart(in: newReading, completedAfter: evaluatedCount, userDictionary: userDictionary),
+                // [Hazkey Community Patch]
+                // 制約を満たす候補が無い制約には、評価済みの読みの中で揃っていたユーザ辞書の語の表記も残り得る
+                // 引き継ぐと上の分岐と同じく語が固定され得るため、評価済みの読みで始まる語も調べる (completedAfter: 0)
+                if let cutoff = Self.userDictionaryWordStart(in: newReading, completedAfter: 0, userDictionary: userDictionary),
                    cutoff < evaluatedCount {
                     // 制約の表記と読みの対応が分からないため、語の手前で切れない
                     return PrefixConstraint([])
@@ -220,6 +254,29 @@ extension Kana2Kanji {
         }
     }
 
+    // [Hazkey Community Patch]
+    /// Zenzaiの評価・再試行・制約の引き継ぎで、ユーザ辞書の語と同じく扱う語
+    /// ユーザ辞書の語は常に、学習語は要求で指定された読みと表記のものだけを保護する
+    struct ZenzaiWordProtection: Sendable, Hashable {
+        var learnedWords: Set<ConvertRequestOptions.ZenzaiMode.ProtectedLearnedWord> = []
+
+        func protects(_ element: DicdataElement) -> Bool {
+            element.metadata.contains(.isFromUserDictionary) || self.protectsLearnedWord(element)
+        }
+
+        func protectsLearnedWord(_ element: DicdataElement) -> Bool {
+            !self.learnedWords.isEmpty
+                && element.metadata.contains(.isLearned)
+                && self.learnedWords.contains(.init(ruby: element.ruby, word: element.word))
+        }
+
+        var learnedWordElements: [DicdataElement] {
+            self.learnedWords.map {
+                DicdataElement(word: $0.word, ruby: $0.ruby, cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: 0, metadata: .isLearned)
+            }
+        }
+    }
+
     struct PrefixConstraint: Sendable, Equatable, Hashable, CustomStringConvertible {
         /// 先頭の決まっている部分。モデルはこの表記を左文脈、この読みを入力済みとして扱い、評価しない。
         struct FixedPrefix: Sendable, Equatable, Hashable {
@@ -260,7 +317,8 @@ extension Kana2Kanji {
         requestRichCandidates: Bool,
         personalizationMode: (mode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode, base: EfficientNGram, personal: EfficientNGram)?,
         versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
-        dicdataStoreState: DicdataStoreState
+        dicdataStoreState: DicdataStoreState,
+        wordProtection: ZenzaiWordProtection = ZenzaiWordProtection()
     ) -> (result: LatticeNode, lattice: Lattice, cache: ZenzaiCache) {
         // [Hazkey Community Patch]
         // 任意のCPU遅延期限 (HAZKEY_ZENZAI_DEADLINE_MS) の監視窓を開く
@@ -271,6 +329,9 @@ extension Kana2Kanji {
         let latticeInputData = Self.zenzaiLatticeInputData(for: inputData)
         let zenzInputCursorPosition = Self.zenzaiInputCursorPosition(for: inputData)
         let inputStyle = inputData.input.last?.inputStyle ?? .direct
+        // [Hazkey Community Patch]
+        // 保護する学習語が前回と異なる場合は、前回の制約を引き継がない
+        let zenzaiCache = zenzaiCache?.adoptingWordProtection(wordProtection)
         let defersEvaluationForPendingInput = !requestRichCandidates
             && personalizationMode == nil
             && self.resolvePredictiveInputSource(
@@ -279,7 +340,8 @@ extension Kana2Kanji {
             ).droppedSuffixCount > 0
         var constraint = zenzaiCache?.getNewConstraint(
             for: latticeInputData,
-            userDictionary: dicdataStoreState.dynamicUserDictionary
+            userDictionary: dicdataStoreState.dynamicUserDictionary,
+            protection: wordProtection
         ) ?? PrefixConstraint([])
         let prefixCandidate = zenzaiCache?.prefixCandidate(remainingIn: latticeInputData)
         let resolvedConversionCacheKey: ZenzResolvedConversionCacheKey? =
@@ -323,10 +385,14 @@ extension Kana2Kanji {
                 satisfyingCandidate: cached.satisfyingCandidate,
                 evaluatedSatisfyingCandidate: cached.satisfyingCandidate
             )
+            // [Hazkey Community Patch]
+            // 次の要求で保護の違いを判定できるよう、今回の保護を記録する
+            var protectedNextCache = nextCache
+            protectedNextCache.wordProtection = wordProtection
             return (
                 eosNode,
                 lattice,
-                nextCache
+                protectedNextCache
             )
         }
         debug("initial constraint", constraint)
@@ -340,7 +406,7 @@ extension Kana2Kanji {
             satisfyingCandidate: Candidate?,
             evaluatedSatisfyingCandidate: Candidate? = nil
         ) -> ZenzaiCache {
-            ZenzaiCache(
+            var cache = ZenzaiCache(
                 latticeInputData,
                 constraint: constraint,
                 satisfyingCandidate: satisfyingCandidate,
@@ -348,6 +414,10 @@ extension Kana2Kanji {
                 prefixCandidate: prefixCandidate,
                 lattice: latticeIsComplete ? lattice : nil
             )
+            // [Hazkey Community Patch]
+            // 次の要求で保護の違いを判定できるよう、今回の保護を記録する
+            cache.wordProtection = wordProtection
+            return cache
         }
         defer {
             eosNode.prevs = insertedCandidates.map(\.0)
@@ -517,7 +587,8 @@ extension Kana2Kanji {
                     prefixConstraint: constraint,
                     personalizationMode: personalizationMode,
                     versionDependentConfig: versionDependentConfig,
-                    memoizationCache: zenzaiMemoizationCache
+                    memoizationCache: zenzaiMemoizationCache,
+                    wordProtection: wordProtection
                 )
                 inferenceLimit -= 1
                 ZenzInferencePerf.shared.count { $0.evaluationCount += 1 }
@@ -526,7 +597,8 @@ extension Kana2Kanji {
                     candidates: candidates,
                     reviewResult: reviewResult,
                     constraint: &constraint,
-                    isJinen: isJinen
+                    isJinen: isJinen,
+                    wordProtection: wordProtection
                 )
                 switch nextAction {
                 case .return(let constraint, let alternativeConstraints, let satisfied):
@@ -679,12 +751,22 @@ extension Kana2Kanji {
         )
     }
 
+    // [Hazkey Community Patch]
+    /// 同じ制約が2回返ったとき、学習語の制約免除を外して再試行するか
+    /// 保護する語 (ユーザ辞書の語と、要求で指定された学習語) を含む候補は再試行せず、既存の諦めの経路を使う
+    static func retriesWithoutMemory(_ candidate: Candidate, constraint: PrefixConstraint, protection: ZenzaiWordProtection) -> Bool {
+        !constraint.ignoreMemoryAndUserDictionary
+            && candidate.data.contains(where: { $0.metadata.contains(.isLearned) })
+            && !candidate.data.contains(where: protection.protects)
+    }
+
     private func review(
         candidateIndex: Int,
         candidates: [Candidate],
         reviewResult: consuming CandidateEvaluationResult,
         constraint: inout PrefixConstraint,
-        isJinen: Bool
+        isJinen: Bool,
+        wordProtection: ZenzaiWordProtection
     ) -> NextAction {
         switch reviewResult {
         case .error:
@@ -703,9 +785,7 @@ extension Kana2Kanji {
                 fixedPrefix: constraint.fixedPrefix
             )
             if constraint == newConstraint {
-                if !constraint.ignoreMemoryAndUserDictionary,
-                   candidates[candidateIndex].data.contains(where: { !$0.metadata.isDisjoint(with: [.isLearned]) }),
-                   candidates[candidateIndex].data.allSatisfy({ $0.metadata.isDisjoint(with: [.isFromUserDictionary]) }) {
+                if Self.retriesWithoutMemory(candidates[candidateIndex], constraint: constraint, protection: wordProtection) {
                     // [Hazkey Community Patch]
                     // 明示的に登録されたユーザ辞書候補を保持する
                     // 同じ制約の繰り返しはユーザ辞書エントリを含む場合既存の諦め経路を使い学習エントリだけがこのリトライを残す
@@ -750,9 +830,7 @@ extension Kana2Kanji {
             )
             // 同じ制約が2回連続で出てきたら諦める
             if constraint == newConstraint {
-                if !constraint.ignoreMemoryAndUserDictionary,
-                   candidates[candidateIndex].data.contains(where: { !$0.metadata.isDisjoint(with: [.isLearned]) }),
-                   candidates[candidateIndex].data.allSatisfy({ $0.metadata.isDisjoint(with: [.isFromUserDictionary]) }) {
+                if Self.retriesWithoutMemory(candidates[candidateIndex], constraint: constraint, protection: wordProtection) {
                     // [Hazkey Community Patch]
                     // 明示的に登録されたユーザ辞書候補を保持する
                     // 同じ制約の繰り返しはユーザ辞書エントリを含む場合既存の諦め経路を使い学習エントリだけがこのリトライを残す
