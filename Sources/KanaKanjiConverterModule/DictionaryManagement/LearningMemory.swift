@@ -600,7 +600,7 @@ struct LongTermLearningMemory {
             }
             for i in indices.indices {
                 guard metadataOffset < ltMetadata.endIndex else {
-                    break
+                    break shardLoop
                 }
                 // メタデータの読み取り
                 guard let metadata = readMetadataBlock() else {
@@ -614,7 +614,7 @@ struct LongTermLearningMemory {
                     debug("LongTermLearningMemory merge skipped a node with an out-of-range entry", loudstxtIndex, i)
                     continue
                 }
-                let elements = LOUDS.parseBinary(binary: loudstxtData[startIndex ..< endIndex])
+                let elements = LOUDS.parseLoudstxt3Binary(binary: loudstxtData, indices: [i])
                 // 該当部分を取り出してメタデータに従ってフィルター、trieに追加
                 guard let ruby = elements.first?.ruby,
                       let chars = LearningManager.keyToChars(ruby, char2UInt8: char2UInt8) else {
@@ -895,6 +895,10 @@ struct TemporalLearningMemoryTrie {
     }
 
     mutating func memorize(dicdataElement: DicdataElement, chars: [UInt8]) {
+        // Reject before creating nodes or metadata, including synthesized phrase entries.
+        guard Loudstxt3Builder.isValidText(ruby: dicdataElement.ruby, word: dicdataElement.word) else {
+            return
+        }
         var index = 0
         for char in chars {
             if let nextIndex = nodes[index].children[char] {

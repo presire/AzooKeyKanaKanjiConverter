@@ -8,6 +8,126 @@ final class LearningMemoryTests: XCTestCase {
         .init(learningType: .inputAndOutput, maxMemoryCount: 32, memoryURL: memoryURL)
     }
 
+    func testTabsAreNotLearnedAsWordsOrCombinedEntries() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("LearningMemoryTabs-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manager = LearningManager(dictionaryURL: Self.resourceURL)
+        _ = manager.updateConfig(getConfigForMemoryTest(memoryURL: dir))
+        manager.char2UInt8["\t"] = 255
+        let valid = DicdataElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+        let invalidWord = DicdataElement(word: "テ\tスト", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+        let invalidRuby = DicdataElement(word: "テスト", ruby: "テ\tスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+        manager.update(data: [invalidWord])
+        manager.update(data: [invalidRuby])
+        XCTAssertFalse(try manager.save())
+
+        manager.update(data: [valid, invalidWord, valid])
+        XCTAssertTrue(try manager.save())
+        // Re-merge the saved data to check numeric rows and metadata stay aligned.
+        manager.update(data: [valid])
+        XCTAssertTrue(try manager.save())
+        let data = try Data(contentsOf: dir.appendingPathComponent("memory0.loudstxt3"))
+        let count = try XCTUnwrap(LOUDS.loudstxt3EntryCount(binary: data))
+        let parsed = LOUDS.parseLoudstxt3Binary(binary: data, indices: Array(0 ..< count))
+        XCTAssertEqual(parsed.map { $0.word }, [valid.word])
+        XCTAssertEqual(parsed.map { $0.ruby }, [valid.ruby])
+    }
+
+    func testSaveKeepsLaterShardsWhenEarlierShardIsMissing() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("LearningMemoryShards-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manager = LearningManager(dictionaryURL: Self.resourceURL)
+        _ = manager.updateConfig(getConfigForMemoryTest(memoryURL: dir))
+        let longRuby = String(repeating: "テ", count: DictionaryBuilder.entriesPerShard)
+        let old = DicdataElement(word: "長い読み", ruby: longRuby, cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+        let lost = DicdataElement(word: "消える語", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -11)
+        manager.update(data: [old])
+        manager.update(data: [lost])
+        XCTAssertTrue(try manager.save())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("memory1.loudstxt3").path))
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("memory0.loudstxt3"))
+
+        let new = DicdataElement(word: "テスター", ruby: "テスター", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -12)
+        manager.update(data: [new])
+        XCTAssertTrue(try manager.save())
+        var parsed: [DicdataElement] = []
+        for shard in 0 ... 1 {
+            let data = try Data(contentsOf: dir.appendingPathComponent("memory\(shard).loudstxt3"))
+            let count = try XCTUnwrap(LOUDS.loudstxt3EntryCount(binary: data))
+            parsed += LOUDS.parseLoudstxt3Binary(binary: data, indices: Array(0 ..< count))
+        }
+        XCTAssertEqual(Set(parsed.map { $0.word }), [old.word, new.word])
+    }
+
+    func testSaveDiscardsCorruptStoredEntries() throws {
+        for corruption in ["extra-tab", "truncated-rows", "invalid-offset", "truncated-header"] {
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("LearningMemoryCorrupt-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let manager = LearningManager(dictionaryURL: Self.resourceURL)
+            _ = manager.updateConfig(getConfigForMemoryTest(memoryURL: dir))
+            let old = DicdataElement(word: "テスト", ruby: "テスト", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+            manager.update(data: [old])
+            XCTAssertTrue(try manager.save())
+            let url = dir.appendingPathComponent("memory0.loudstxt3")
+            var data = try Data(contentsOf: url)
+            let count = try XCTUnwrap(LOUDS.loudstxt3EntryCount(binary: data))
+            let lastOffsetPosition = 2 + (count - 1) * 4
+            let lastOffset = (0 ..< 4).reduce(0) { $0 | Int(data[lastOffsetPosition + $1]) << ($1 * 8) }
+            switch corruption {
+            case "extra-tab":
+                data.append(contentsOf: "\t余分".utf8)
+            case "truncated-rows":
+                data = Data(data.prefix(lastOffset + 2))
+            case "invalid-offset":
+                data.replaceSubrange(lastOffsetPosition ..< lastOffsetPosition + 4, with: [0, 0, 0, 0])
+            default:
+                data = Data([1])
+            }
+            try data.write(to: url)
+            let new = DicdataElement(word: "テスター", ruby: "テスター", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -12)
+            manager.update(data: [new])
+            XCTAssertTrue(try manager.save(), corruption)
+            let saved = try Data(contentsOf: url)
+            let savedCount = try XCTUnwrap(LOUDS.loudstxt3EntryCount(binary: saved))
+            let parsed = LOUDS.parseLoudstxt3Binary(binary: saved, indices: Array(0 ..< savedCount))
+            XCTAssertEqual(parsed.map { $0.word }, [new.word], corruption)
+            XCTAssertEqual(parsed.map { $0.ruby }, [new.ruby], corruption)
+        }
+    }
+
+    func testSaveDiscardsEntryWhoseOffsetPointsIntoHeader() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("LearningMemoryHeaderOffset-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manager = LearningManager(dictionaryURL: Self.resourceURL)
+        _ = manager.updateConfig(getConfigForMemoryTest(memoryURL: dir))
+        let old = DicdataElement(word: "手", ruby: "テ", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -10)
+        manager.update(data: [old])
+        XCTAssertTrue(try manager.save())
+        let url = dir.appendingPathComponent("memory0.loudstxt3")
+        let original = try Data(contentsOf: url)
+        XCTAssertEqual(LOUDS.loudstxt3EntryCount(binary: original), 3)
+        XCTAssertEqual(LOUDS.parseLoudstxt3Binary(binary: original, indices: [2]).map { $0.word }, [old.word])
+
+        // Node 2 starts at byte 2, inside the 14-byte header; bytes 2... still decode as one valid row for ニセ.
+        var data = Data([3, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0])
+        data.append(contentsOf: "ニセ\t".utf8)
+        XCTAssertEqual(LOUDS.parseBinary(binary: data[2...]).map { $0.ruby }, ["ニセ"])
+        XCTAssertTrue(LOUDS.parseLoudstxt3Binary(binary: data, indices: [0, 1, 2]).isEmpty)
+        try data.write(to: url)
+
+        let new = DicdataElement(word: "テスター", ruby: "テスター", cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid, value: -12)
+        manager.update(data: [new])
+        XCTAssertTrue(try manager.save())
+        let saved = try Data(contentsOf: url)
+        let savedCount = try XCTUnwrap(LOUDS.loudstxt3EntryCount(binary: saved))
+        let parsed = LOUDS.parseLoudstxt3Binary(binary: saved, indices: Array(0 ..< savedCount))
+        XCTAssertEqual(parsed.map { $0.ruby }, [new.ruby])
+    }
+
     func testSaveSkipsWhenNoPendingMemory() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("LearningMemoryTest-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
