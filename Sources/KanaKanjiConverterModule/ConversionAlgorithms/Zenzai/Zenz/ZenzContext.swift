@@ -978,7 +978,6 @@ final class ZenzContext {
     private var prevInputBySeq: [llama_seq_id: [llama_token]] = [:]
     /// [Hazkey Community Patch] A7: 直前のリッチ評価のロジット行 (評価用シーケンスのみ)
     private let richLogitsRows: RichLogitsRowStore
-    private var prevPromptBySeq: [llama_seq_id: String] = [:]
     // [Hazkey Community Patch] tokenToPiece(token:) の復号結果 (トークンIDで添字付け、未復号は nil)
     private var pieceCache: [[CChar]?] = []
     /// このコンテキストのデバイス構成 (再生成時に再利用する)
@@ -1254,7 +1253,6 @@ final class ZenzContext {
         )
         self.prevInputBySeq = [:]
         self.richLogitsRows.release()
-        self.prevPromptBySeq = [:]
     }
 
     /// リッチ評価で前回計算したロジット行を使い回す計画
@@ -1422,14 +1420,6 @@ final class ZenzContext {
             reusedRows: reusedRows,
             freshRows: freshStart < tokens.count ? llama_get_logits(context) : nil
         )
-    }
-
-    func previousEvaluationPrompt() -> String {
-        self.prevPromptBySeq[evalSeqId] ?? ""
-    }
-
-    func setPreviousEvaluationPrompt(_ prompt: String) {
-        self.prevPromptBySeq[evalSeqId] = prompt
     }
 
     func normalizeForModel(_ text: String) -> String {

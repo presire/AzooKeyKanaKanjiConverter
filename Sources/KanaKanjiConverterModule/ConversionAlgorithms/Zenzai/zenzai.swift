@@ -424,6 +424,9 @@ extension Kana2Kanji {
         }
         var inferenceLimit = inferenceLimit
         var draftIteration = 0
+        // Only reuse an evaluated prefix within this search. Prediction can evaluate the
+        // same reading under a different constraint using the same model context.
+        var previousEvaluationPrompt: String?
         while true {
             let start = Date()
             // 学習・ユーザ辞書・personalizationの影響がなく、入力と制約が完全一致する
@@ -588,7 +591,8 @@ extension Kana2Kanji {
                     personalizationMode: personalizationMode,
                     versionDependentConfig: versionDependentConfig,
                     memoizationCache: zenzaiMemoizationCache,
-                    wordProtection: wordProtection
+                    wordProtection: wordProtection,
+                    previousEvaluationPrompt: &previousEvaluationPrompt
                 )
                 inferenceLimit -= 1
                 ZenzInferencePerf.shared.count { $0.evaluationCount += 1 }

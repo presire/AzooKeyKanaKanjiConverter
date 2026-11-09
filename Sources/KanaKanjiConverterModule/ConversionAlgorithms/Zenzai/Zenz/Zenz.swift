@@ -145,7 +145,8 @@ package final class Zenz {
         personalizationMode: (mode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode, base: EfficientNGram, personal: EfficientNGram)?,
         versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
         memoizationCache: ZenzaiMemoizationCache,
-        wordProtection: Kana2Kanji.ZenzaiWordProtection = Kana2Kanji.ZenzaiWordProtection()
+        wordProtection: Kana2Kanji.ZenzaiWordProtection = Kana2Kanji.ZenzaiWordProtection(),
+        previousEvaluationPrompt: inout String?
     ) -> CandidateEvaluationResult {
         self.inferenceLock.withLock {
             guard let zenzContext else {
@@ -162,7 +163,8 @@ package final class Zenz {
                     personalizationMode: personalizationMode,
                     versionDependentConfig: versionDependentConfig,
                     memoizationCache: memoizationCache,
-                    wordProtection: wordProtection
+                    wordProtection: wordProtection,
+                    previousEvaluationPrompt: &previousEvaluationPrompt
                 )
             }
             return .error
