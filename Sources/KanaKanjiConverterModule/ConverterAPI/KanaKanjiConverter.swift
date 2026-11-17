@@ -662,6 +662,7 @@ public final class KanaKanjiConverter {
     ///   - lcid: 削除対象の左接続ID
     ///   - rcid: 削除対象の右接続ID
     /// - Throws: 学習メモリの保存先が無い場合や削除の保存に失敗した場合
+    /// - Note: 学習を更新しない設定でも永続化済みの学習は変換に使われるため、明示的な削除は学習種別によらず実行する
     public func forgetLearningMemory(reading: String, word: String, lcid: Int, rcid: Int) throws {
         try self.dicdataStoreState.forgetLearningMemory(
             exactly: .init(reading: reading, word: word, lcid: lcid, rcid: rcid)
@@ -699,12 +700,24 @@ public final class KanaKanjiConverter {
     ///
     /// 一時記憶 (未永続化の学習) は含まない
     ///
+    /// 一時記憶は pendingLearningMemoryKeys(exactReadings:) で取得する
+    ///
     /// - Parameter exactReadings: 完全一致で探す読みの一覧
     /// - Returns: 読みと表記と品詞IDのキーの一覧
     /// - Throws: 学習データの置き場が無い場合や停止中や破損の場合
     /// - Note: memoryDirectoryURLはrequestCandidates(_:options:)の内部で遅延適用されるためプロファイル切替直後は変換要求の**後**に呼ぶ必要がある
     public func persistedLearningMemoryKeys(exactReadings: [String]) throws -> [PersistedLearningMemoryKey] {
         try self.dicdataStoreState.persistedLearningMemoryKeys(exactReadings: exactReadings)
+    }
+
+    /// 一時記憶から指定した読みに完全一致する学習エントリのキーを取得する
+    ///
+    /// 永続化前の未確定の学習だけを対象とし、ディスクの読み出しは行わない
+    ///
+    /// - Parameter exactReadings: 完全一致で探す読みの一覧
+    /// - Returns: 読みと表記と品詞IDのキーの一覧
+    public func pendingLearningMemoryKeys(exactReadings: [String]) -> [PersistedLearningMemoryKey] {
+        self.dicdataStoreState.pendingLearningMemoryKeys(exactReadings: exactReadings)
     }
 
     /// 確定操作後の学習メモリの更新を確定させます。

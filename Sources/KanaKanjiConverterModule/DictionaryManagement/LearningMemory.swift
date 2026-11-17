@@ -1167,6 +1167,38 @@ final class LearningManager {
         return self.temporaryMemory.perfectMatch(chars: charIDs)
     }
 
+    /// 一時記憶から指定した読みに完全一致する学習メモリのキーを取得する
+    ///
+    /// 永続化前の未確定の学習だけを対象とし、ディスクの読み出しは行わない
+    ///
+    /// 同じ読みが複数回指定されても結果は重複しない
+    ///
+    /// 未知文字を含む読みは木に存在し得ないため空になる
+    ///
+    /// - Parameter exactReadings: 完全一致で探す読みの一覧
+    /// - Returns: 読みと表記と品詞IDのキーの一覧
+    func pendingLearningMemoryKeys(exactReadings: [String]) -> [PersistedLearningMemoryKey] {
+        guard self.enabled else {
+            return []
+        }
+        var keys: [PersistedLearningMemoryKey] = []
+        var seenReadings: Set<String> = []
+        for reading in exactReadings where !reading.isEmpty {
+            guard seenReadings.insert(reading).inserted else {
+                continue
+            }
+            guard let chars = Self.keyToChars(reading, char2UInt8: self.char2UInt8) else {
+                continue
+            }
+            keys.append(
+                contentsOf: self.temporaryMemory.perfectMatch(chars: chars).map {
+                    PersistedLearningMemoryKey(reading: $0.ruby, word: $0.word, lcid: $0.lcid, rcid: $0.rcid)
+                }
+            )
+        }
+        return keys
+    }
+
     func movingTowardPrefixSearchOnTemporaryMemory(charIDs: [UInt8], depth: Range<Int> = 0 ..< .max) -> (dicdata: [Int: [DicdataElement]], availableMaxIndex: Int) {
         guard self.config.learningType.needUsingMemory else {
             return ([:], 0)
@@ -1341,10 +1373,8 @@ final class LearningManager {
     ///
     /// - Parameter target: 削除対象の読みと表記と品詞ID
     /// - Throws: 学習データの置き場が無い場合や書き込みに失敗した場合は列挙時やファイル操作のエラー
+    /// - Note: 学習を更新しない設定でも永続化済みの学習は変換に使われるため、明示的な削除は学習種別によらず実行する
     func forgetLearningMemory(exactly target: LearningMemoryKey) throws {
-        guard self.config.learningType.needUpdateMemory else {
-            return
-        }
         guard let memoryURL = config.memoryURL else {
             throw LearningMemoryEnumerationError.memoryDirectoryUnavailable
         }

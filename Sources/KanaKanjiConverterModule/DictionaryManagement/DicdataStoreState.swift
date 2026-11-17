@@ -238,6 +238,7 @@ package final class DicdataStoreState {
     ///
     /// - Parameter target: 削除対象の読みと表記と品詞ID
     /// - Throws: 学習データの保存に失敗した場合は書き込み時のエラー
+    /// - Note: 学習を更新しない設定でも永続化済みの学習は変換に使われるため、明示的な削除は学習種別によらず実行する
     func forgetLearningMemory(exactly target: LearningMemoryKey) throws {
         try self.learningMemoryManager.forgetLearningMemory(exactly: target)
         self.resetMemoryLOUDSCache()
@@ -273,6 +274,8 @@ package final class DicdataStoreState {
     ///
     /// 一時記憶は参照せず、永続化済みの内容だけを見る
     ///
+    /// 一時記憶は pendingLearningMemoryKeys(exactReadings:) で取得する
+    ///
     /// - Parameter exactReadings: 完全一致で探す読みの一覧
     /// - Returns: 読みと表記と品詞IDのキーの一覧
     /// - Throws: 学習データの置き場が無い場合や停止中の場合は列挙時のエラー
@@ -293,6 +296,16 @@ package final class DicdataStoreState {
             char2UInt8: self.learningMemoryManager.char2UInt8,
             exactReadings: exactReadings
         )
+    }
+
+    /// 一時記憶から指定した読みに完全一致する学習エントリのキーを取得する
+    ///
+    /// 永続化前の未確定の学習だけを対象とし、ディスクの読み出しは行わない
+    ///
+    /// - Parameter exactReadings: 完全一致で探す読みの一覧
+    /// - Returns: 読みと表記と品詞IDのキーの一覧
+    func pendingLearningMemoryKeys(exactReadings: [String]) -> [PersistedLearningMemoryKey] {
+        self.learningMemoryManager.pendingLearningMemoryKeys(exactReadings: exactReadings)
     }
 
     // 学習を反映する
