@@ -1164,7 +1164,12 @@ public final class KanaKanjiConverter {
         // 比較的大きい配列（〜1000、2000程度の候補が含まれることがある）
         let clauseResult = result.result.getCandidateData()
         if clauseResult.isEmpty {
-            self.invalidateStablePredictionCandidateCache()
+            // [Hazkey Community Patch]
+            // 予測なしの要求 ([Space] の変換など) は予測候補を作らないため、入力中に作った予測候補のキャッシュを消さない
+            // [Esc] で入力中の表示へ戻したとき、同じ予測候補を返すため (以下の予測候補のキャッシュの消去・更新も同じ条件にする)
+            if options.requireJapanesePrediction.isEnabled {
+                self.invalidateStablePredictionCandidateCache()
+            }
             let candidates = self.candidates(
                 self.getUniqueCandidate(self.getAdditionalCandidate(inputData, options: options)),
                 matchingPrefix: prefixText
@@ -1210,7 +1215,10 @@ public final class KanaKanjiConverter {
         }()
 
         if case .完全一致 = options.requestQuery {
-            self.invalidateStablePredictionCandidateCache()
+            // [Hazkey Community Patch] 予測なしの要求では予測候補のキャッシュを消さない (上の clauseResult.isEmpty の分岐と同じ理由)
+            if options.requireJapanesePrediction.isEnabled {
+                self.invalidateStablePredictionCandidateCache()
+            }
             let merged = self.candidates(
                 self.getUniqueCandidate(wholeSentenceUniqueCandidates.chained(userShortcutsCandidates)),
                 matchingPrefix: prefixText
@@ -1266,7 +1274,10 @@ public final class KanaKanjiConverter {
                     bestThreePredictionCandidates = []
                 }
             } else {
-                self.invalidateStablePredictionCandidateCache()
+                // [Hazkey Community Patch] 予測なしの要求では予測候補のキャッシュを消さない (clauseResult.isEmpty の分岐と同じ理由)
+                if options.requireJapanesePrediction.isEnabled {
+                    self.invalidateStablePredictionCandidateCache()
+                }
                 bestThreePredictionCandidates = []
             }
             // 英単語の予測変換。appleのapiを使うため、処理が異なる。
@@ -1378,7 +1389,11 @@ public final class KanaKanjiConverter {
             wordCandidates = consume candidates
         }
 
-        self.updateStablePredictionCandidateCache(inputData: inputData, inputStyle: inputStyle, candidates: predictionResults)
+        // [Hazkey Community Patch]
+        // 予測なしの要求では predictionResults が常に空で、更新するとキャッシュが消えるため、予測ありの要求でだけ更新する
+        if options.requireJapanesePrediction.isEnabled {
+            self.updateStablePredictionCandidateCache(inputData: inputData, inputStyle: inputStyle, candidates: predictionResults)
+        }
 
         var result = consume fullCandidates
         // 3番目までに最低でも1つ、（誤り訂正ではなく）入力に完全一致する候補が入るようにする
