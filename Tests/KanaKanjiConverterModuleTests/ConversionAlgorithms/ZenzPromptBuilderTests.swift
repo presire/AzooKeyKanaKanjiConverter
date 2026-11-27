@@ -120,6 +120,71 @@ final class ZenzPromptBuilderTests: XCTestCase {
         )
     }
 
+    func testCandidateEvaluationPromptV3EmitsEmptyContextTagOnlyWhenRequested() {
+        let withTag = ZenzPromptBuilder.candidateEvaluationPrompt(
+            input: "ハシ",
+            userDictionaryPrompt: "",
+            versionDependentConfig: .v3(.init()),
+            alwaysEmitContextTag: true
+        )
+        let defaultPrompt = ZenzPromptBuilder.candidateEvaluationPrompt(
+            input: "ハシ",
+            userDictionaryPrompt: "",
+            versionDependentConfig: .v3(.init())
+        )
+
+        XCTAssertEqual(withTag, "\u{EE02}\u{EE00}ハシ\u{EE01}")
+        XCTAssertEqual(defaultPrompt, "\u{EE00}ハシ\u{EE01}")
+    }
+
+    func testCandidateEvaluationPromptV3WithNonEmptyLeftContextDoesNotDuplicateContextTag() {
+        let mode = ConvertRequestOptions.ZenzaiV3DependentMode(leftSideContext: "昨日")
+        let withTag = ZenzPromptBuilder.candidateEvaluationPrompt(
+            input: "ハシ",
+            userDictionaryPrompt: "",
+            versionDependentConfig: .v3(mode),
+            alwaysEmitContextTag: true
+        )
+        let defaultPrompt = ZenzPromptBuilder.candidateEvaluationPrompt(
+            input: "ハシ",
+            userDictionaryPrompt: "",
+            versionDependentConfig: .v3(mode)
+        )
+
+        XCTAssertEqual(withTag, "\u{EE02}昨日\u{EE00}ハシ\u{EE01}")
+        XCTAssertEqual(withTag, defaultPrompt)
+    }
+
+    func testInputPredictionPromptV3EmitsEmptyContextTagOnlyWhenRequested() {
+        let emptyWithTag = ZenzPromptBuilder.inputPredictionPrompt(
+            leftSideContext: "",
+            composingText: "かんじ",
+            versionDependentConfig: .v3(.init()),
+            alwaysEmitContextTag: true
+        )
+        let emptyDefault = ZenzPromptBuilder.inputPredictionPrompt(
+            leftSideContext: "",
+            composingText: "かんじ",
+            versionDependentConfig: .v3(.init())
+        )
+        let nonEmptyWithTag = ZenzPromptBuilder.inputPredictionPrompt(
+            leftSideContext: "昨日",
+            composingText: "かんじ",
+            versionDependentConfig: .v3(.init()),
+            alwaysEmitContextTag: true
+        )
+        let nonEmptyDefault = ZenzPromptBuilder.inputPredictionPrompt(
+            leftSideContext: "昨日",
+            composingText: "かんじ",
+            versionDependentConfig: .v3(.init())
+        )
+
+        XCTAssertEqual(emptyWithTag, "\u{EE02}\u{EE00}カンジ")
+        XCTAssertEqual(emptyDefault, "\u{EE00}カンジ")
+        XCTAssertEqual(nonEmptyWithTag, "\u{EE02}昨日\u{EE00}カンジ")
+        XCTAssertEqual(nonEmptyWithTag, nonEmptyDefault)
+    }
+
     func testCandidateTextForEvaluationV3DoesNotAppendAlignmentSeparatorByDefault() {
         let text = ZenzCandidateEvaluator.candidateTextForEvaluation(
             candidateText: "葉",

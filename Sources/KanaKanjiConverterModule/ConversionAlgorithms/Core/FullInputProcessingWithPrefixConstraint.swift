@@ -3,22 +3,137 @@ import Foundation
 import SwiftUtils
 
 extension Kana2Kanji {
+    // [Hazkey Community Patch]
+    /// UTF-8バイト列をNFKC正規化後のUTF-8バイト列へ変換する
+    ///
+    /// 純ASCII列はNFKC不変のためそのまま返し、不正なUTF-8バイト列は生バイトへフォールバックする
+    ///
+    /// - Parameter bytes: 変換対象のUTF-8バイト列
+    /// - Returns: NFKC正規化後のUTF-8バイト列
+    static func normalizedNFKCBytes(_ bytes: [UInt8]) -> [UInt8] {
+        if bytes.allSatisfy({ $0 < 0x80 }) {
+            return bytes
+        }
+        guard let string = String(bytes: bytes, encoding: .utf8) else {
+            return bytes
+        }
+        return Array(string.precomposedStringWithCompatibilityMapping.utf8)
+    }
+
+    // [Hazkey Community Patch]
+    /// 文字列をNFKC正規化後のUTF-8バイト列へ変換する
+    ///
+    /// 純ASCII文字列はNFKC不変のためFoundation正規化を省略する
+    ///
+    /// - Parameter string: 変換対象の文字列
+    /// - Returns: NFKC正規化後のUTF-8バイト列
+    private static func normalizedNFKCBytes(of string: String) -> [UInt8] {
+        if string.utf8.allSatisfy({ $0 < 0x80 }) {
+            return Array(string.utf8)
+        }
+        return Array(string.precomposedStringWithCompatibilityMapping.utf8)
+    }
+
+    // [Hazkey Community Patch]
+    /// ラティス制約照合で使用する実効制約バイト列を構築する
+    ///
+    /// Jinenの未固定制約照合が有効な場合、先頭のfixedPrefix区間は生UTF-8のまま保持し、
+    /// fixedPrefixより後ろのモデル制約区間だけをNFKC正規化バイト列へ変換する
+    ///
+    /// - Parameters:
+    ///   - constraint: 照合対象のPrefixConstraint
+    ///   - fixedByteCount: 先頭の生UTF-8固定区間のバイト数
+    /// - Returns: 照合空間へ変換済みの実効制約バイト列
+    private static func effectiveConstraintBytes(
+        for constraint: PrefixConstraint,
+        fixedByteCount: Int
+    ) -> [UInt8] {
+        guard constraint.normalizesUnfixedConstraintForJinen else {
+            return constraint.constraint
+        }
+        let clampedFixedCount = min(fixedByteCount, constraint.constraint.count)
+        guard clampedFixedCount > 0 else {
+            return Self.normalizedNFKCBytes(constraint.constraint)
+        }
+        var result = Array(constraint.constraint.prefix(clampedFixedCount))
+        result.append(contentsOf: Self.normalizedNFKCBytes(Array(constraint.constraint.dropFirst(clampedFixedCount))))
+        return result
+    }
+
+    // [Hazkey Community Patch]
+    /// JinenのNFKC制約照合時にノード表記を比較用バイト列へ変換する
+    ///
+    /// fixedPrefix区間内に収まる部分は生UTF-8のまま返し、fixedPrefixより後ろの部分だけをNFKC正規化する
+    ///
+    /// ノードがfixedPrefixの境界をまたぐ場合は、境界の手前を生UTF-8、後ろをNFKCとして連結する
+    ///
+    /// - Parameters:
+    ///   - prevTotal: 直前ノードまでの比較空間における累積バイト数
+    ///   - word: 現在ノードの辞書表記
+    ///   - fixedByteCount: 先頭の生UTF-8固定区間のバイト数
+    /// - Returns: 実効制約バイト列と同じ比較空間上のバイト列
+    static func normalizedComparisonSegment(
+        prevTotal: Int,
+        word: String,
+        fixedByteCount: Int
+    ) -> [UInt8] {
+        if fixedByteCount == 0 || prevTotal >= fixedByteCount {
+            return Self.normalizedNFKCBytes(of: word)
+        }
+        let rawCount = word.utf8.count
+        if prevTotal + rawCount <= fixedByteCount {
+            return Array(word.utf8)
+        }
+        let rawTakeCount = fixedByteCount - prevTotal
+        let utf8View = word.utf8
+        let splitUTF8Index = utf8View.index(utf8View.startIndex, offsetBy: rawTakeCount)
+        var segment = Array(utf8View[..<splitUTF8Index])
+        if let splitIndex = String.Index(splitUTF8Index, within: word) {
+            segment.append(contentsOf: Self.normalizedNFKCBytes(of: String(word[splitIndex...])))
+        } else {
+            segment.append(contentsOf: utf8View[splitUTF8Index...])
+        }
+        return segment
+    }
+
     // Compute matched bytes with constraint and total candidate bytes for (prev-chain + currentWord)
     private func computeMatchedAndTotalLength(
         prev: borrowing RegisteredNode?,
         currentWord: borrowing String,
-        constraintBytes: borrowing [UInt8]
+        constraintBytes: borrowing [UInt8],
+        normalizesUnfixedForJinen: Bool,
+        fixedByteCount: Int
     ) -> (matched: Int, total: Int) {
         let previousTotal = prev.map { Int($0.candidateUTF8Count) } ?? 0
         var matched = prev.map { Int($0.constraintMatchedUTF8Count) } ?? 0
-        let total = previousTotal + currentWord.utf8.count
+        if !normalizesUnfixedForJinen {
+            let total = previousTotal + currentWord.utf8.count
 
-        // 直前までに不一致がなければ、今回追加する単語だけを照合する。
-        // RegisteredNode生成時に累積値を保持するため、経路全体の再走査は不要。
+            // 直前までに不一致がなければ、今回追加する単語だけを照合する。
+            // RegisteredNode生成時に累積値を保持するため、経路全体の再走査は不要。
+            guard matched == min(previousTotal, constraintBytes.count) else {
+                return (matched, total)
+            }
+            for byte in currentWord.utf8 {
+                guard matched < constraintBytes.count, byte == constraintBytes[matched] else {
+                    break
+                }
+                matched += 1
+            }
+            return (matched, total)
+        }
+        // [Hazkey Community Patch]
+        // Jinenの未固定制約はNFKC空間で比較し、fixedPrefix区間だけは生UTF-8を維持する
+        let segment = Self.normalizedComparisonSegment(
+            prevTotal: previousTotal,
+            word: currentWord,
+            fixedByteCount: fixedByteCount
+        )
+        let total = previousTotal + segment.count
         guard matched == min(previousTotal, constraintBytes.count) else {
             return (matched, total)
         }
-        for byte in currentWord.utf8 {
+        for byte in segment {
             guard matched < constraintBytes.count, byte == constraintBytes[matched] else {
                 break
             }
@@ -36,23 +151,51 @@ extension Kana2Kanji {
     // Extend match with next word starting from current matched index
     private func extendMatched(
         matched: Int,
+        previousTotal: Int,
         nextWord: borrowing String,
-        constraintBytes: borrowing [UInt8]
-    ) -> (matched: Int, mismatch: Bool) {
+        constraintBytes: borrowing [UInt8],
+        normalizesUnfixedForJinen: Bool,
+        fixedByteCount: Int
+    ) -> (matched: Int, mismatch: Bool, addedLength: Int) {
+        if !normalizesUnfixedForJinen {
+            let nextLength = nextWord.utf8.count
+            var ci = matched
+            if ci >= constraintBytes.count {
+                return (ci, false, nextLength)
+            }
+            for b in nextWord.utf8 {
+                if ci >= constraintBytes.count {
+                    return (ci, false, nextLength)
+                }
+                if b != constraintBytes[ci] {
+                    return (ci, true, nextLength)
+                }
+                ci += 1
+            }
+            return (ci, false, nextLength)
+        }
+        // [Hazkey Community Patch]
+        // Jinen時はcomputeMatchedAndTotalLengthと同一の比較空間で一致と加算バイト数を算出する
+        let segment = Self.normalizedComparisonSegment(
+            prevTotal: previousTotal,
+            word: nextWord,
+            fixedByteCount: fixedByteCount
+        )
+        let nextLength = segment.count
         var ci = matched
         if ci >= constraintBytes.count {
-            return (ci, false)
+            return (ci, false, nextLength)
         }
-        for b in nextWord.utf8 {
+        for b in segment {
             if ci >= constraintBytes.count {
-                return (ci, false)
+                return (ci, false, nextLength)
             }
             if b != constraintBytes[ci] {
-                return (ci, true)
+                return (ci, true, nextLength)
             }
             ci += 1
         }
-        return (ci, false)
+        return (ci, false, nextLength)
     }
 
     /// カナを漢字に変換する関数, 前提はなくかな列が与えられた場合。
@@ -113,9 +256,12 @@ extension Kana2Kanji {
                 rawNodes: rawNodes
             )
         }
-        let constraintBytes = constraint.constraint
-        let constraintLength = constraintBytes.count
         let fixedByteCount = constraint.fixedPrefix?.byteCount ?? 0
+        // [Hazkey Community Patch]
+        // Jinen時はfixedPrefixより後ろの制約だけをNFKC正規化して照合空間を統一し、Zenz時は生UTF-8のまま維持する
+        let normalizesUnfixedForJinen = constraint.normalizesUnfixedConstraintForJinen
+        let constraintBytes = Self.effectiveConstraintBytes(for: constraint, fixedByteCount: fixedByteCount)
+        let constraintLength = constraintBytes.count
         // [Hazkey Community Patch]
         // 学習語の制約免除を外して再試行するとき (ignoreMemoryAndUserDictionary) は学習語にも制約をかける。ユーザ辞書の語は従来どおりモデル由来の制約を免除する (固定表記は掛ける)。
         // 上流は再試行で全ノードの制約を外しており、同じ学習語が再び選ばれていた。
@@ -138,7 +284,9 @@ extension Kana2Kanji {
                     let matchState = self.computeMatchedAndTotalLength(
                         prev: previous,
                         currentWord: node.data.word,
-                        constraintBytes: constraintBytes
+                        constraintBytes: constraintBytes,
+                        normalizesUnfixedForJinen: normalizesUnfixedForJinen,
+                        fixedByteCount: fixedByteCount
                     )
                     if nextIndex.surfaceIndex == surfaceCount {
                         if node.data.metadata.isDisjoint(with: constraintExemptMetadata) {
@@ -179,11 +327,13 @@ extension Kana2Kanji {
                                 == min(matchState.total, constraintLength) else {
                                 continue
                             }
-                            let nextLength = nextNode.data.word.utf8.count
-                            let (matched, mismatch) = self.extendMatched(
+                            let (matched, mismatch, nextLength) = self.extendMatched(
                                 matched: matchState.matched,
+                                previousTotal: matchState.total,
                                 nextWord: nextNode.data.word,
-                                constraintBytes: constraintBytes
+                                constraintBytes: constraintBytes,
+                                normalizesUnfixedForJinen: normalizesUnfixedForJinen,
+                                fixedByteCount: fixedByteCount
                             )
                             if mismatch {
                                 continue
@@ -201,12 +351,15 @@ extension Kana2Kanji {
                                 continue
                             }
                         } else {
-                            let (matched, _) = self.extendMatched(
+                            let (matched, _, nextLength) = self.extendMatched(
                                 matched: matchState.matched,
+                                previousTotal: matchState.total,
                                 nextWord: nextNode.data.word,
-                                constraintBytes: constraintBytes
+                                constraintBytes: constraintBytes,
+                                normalizesUnfixedForJinen: normalizesUnfixedForJinen,
+                                fixedByteCount: fixedByteCount
                             )
-                            let newTotal = matchState.total + nextNode.data.word.utf8.count
+                            let newTotal = matchState.total + nextLength
                             guard self.matchesFixedPrefix(matched: matched, total: newTotal, fixedByteCount: fixedByteCount) else {
                                 continue
                             }
@@ -239,7 +392,13 @@ extension Kana2Kanji {
                 if nextIndex.surfaceIndex == surfaceCount {
                     // Precompute matched/total lengths per prev for (prev + current word)
                     let mtPerPrev: [(matched: Int, total: Int)] = node.prevs.indices.map { idx in
-                        self.computeMatchedAndTotalLength(prev: node.prevs[idx], currentWord: node.data.word, constraintBytes: constraintBytes)
+                        self.computeMatchedAndTotalLength(
+                            prev: node.prevs[idx],
+                            currentWord: node.data.word,
+                            constraintBytes: constraintBytes,
+                            normalizesUnfixedForJinen: normalizesUnfixedForJinen,
+                            fixedByteCount: fixedByteCount
+                        )
                     }
                     for index in node.prevs.indices {
                         // メタ情報が制約免除対象と重なる語はモデル制約を掛けない (ユーザ辞書の語は常に免除、学習語はignoreMemoryAndUserDictionaryが偽のときだけ免除)。ただし、固定表記は免除の語にも掛ける。
@@ -277,7 +436,13 @@ extension Kana2Kanji {
                 } else {
                     // Precompute matched/total lengths per prev for (prev + current word)
                     let mtPerPrev: [(matched: Int, total: Int)] = node.prevs.indices.map { idx in
-                        self.computeMatchedAndTotalLength(prev: node.prevs[idx], currentWord: node.data.word, constraintBytes: constraintBytes)
+                        self.computeMatchedAndTotalLength(
+                            prev: node.prevs[idx],
+                            currentWord: node.data.word,
+                            constraintBytes: constraintBytes,
+                            normalizesUnfixedForJinen: normalizesUnfixedForJinen,
+                            fixedByteCount: fixedByteCount
+                        )
                     }
                     let ccLatter = self.dicdataStore.getCCLatter(node.data.rcid)
                     // nodeの繋がる次にあり得る全てのnextnodeに対して
@@ -304,9 +469,15 @@ extension Kana2Kanji {
                                 guard matchedPrev == min(totalPrev, constraintLength) else {
                                     continue
                                 }
-                                let nextLen = nextnode.data.word.utf8.count
                                 // matchedPrevまではconstraintBytesと一致しているので、その先をチェックする
-                                let (matchedExt, mismatch) = self.extendMatched(matched: matchedPrev, nextWord: nextnode.data.word, constraintBytes: constraintBytes)
+                                let (matchedExt, mismatch, nextLen) = self.extendMatched(
+                                    matched: matchedPrev,
+                                    previousTotal: totalPrev,
+                                    nextWord: nextnode.data.word,
+                                    constraintBytes: constraintBytes,
+                                    normalizesUnfixedForJinen: normalizesUnfixedForJinen,
+                                    fixedByteCount: fixedByteCount
+                                )
                                 if mismatch {
                                     continue
                                 }
@@ -326,8 +497,15 @@ extension Kana2Kanji {
                                 }
                             } else {
                                 let (matchedPrev, totalPrev) = mtPerPrev[index]
-                                let (matchedExt, _) = self.extendMatched(matched: matchedPrev, nextWord: nextnode.data.word, constraintBytes: constraintBytes)
-                                let newTotal = totalPrev + nextnode.data.word.utf8.count
+                                let (matchedExt, _, nextLen) = self.extendMatched(
+                                    matched: matchedPrev,
+                                    previousTotal: totalPrev,
+                                    nextWord: nextnode.data.word,
+                                    constraintBytes: constraintBytes,
+                                    normalizesUnfixedForJinen: normalizesUnfixedForJinen,
+                                    fixedByteCount: fixedByteCount
+                                )
+                                let newTotal = totalPrev + nextLen
                                 guard self.matchesFixedPrefix(matched: matchedExt, total: newTotal, fixedByteCount: fixedByteCount) else {
                                     continue
                                 }

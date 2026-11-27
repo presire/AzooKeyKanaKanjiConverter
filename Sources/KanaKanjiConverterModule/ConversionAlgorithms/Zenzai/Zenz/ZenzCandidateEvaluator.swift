@@ -190,11 +190,14 @@ struct ZenzCandidateEvaluator {
         let effectiveConfig = context.isJinenModel
             ? Self.jinenEvaluationMode(versionDependentConfig)
             : versionDependentConfig
+        // [Hazkey Community Patch]
+        // jinenでは左文脈が空の場合でもコンテキストタグU+EE02を常時付与する
         let prompt = ZenzPromptBuilder.candidateEvaluationPrompt(
             input: input,
             inputCursorPosition: inputCursorPosition,
             userDictionaryPrompt: userDictionaryPrompt,
-            versionDependentConfig: effectiveConfig
+            versionDependentConfig: effectiveConfig,
+            alwaysEmitContextTag: context.isJinenModel
         )
         let candidateTextForEvaluation = self.candidateTextForEvaluation(
             candidateText: candidate.text,
@@ -236,53 +239,54 @@ struct ZenzCandidateEvaluator {
             prompt,
             memoizationCache: memoizationCache
         )
+        // [Hazkey Community Patch]
+        // addBOS=falseのJinen経路でトークン化失敗時に空配列が返った場合でもstartOffset=-1の不正添字を防ぐ
+        guard !promptTokens.isEmpty else {
+            debug("promptTokens is empty")
+            return .error
+        }
         let candidateTokens = context.encode(candidateTextForEvaluation, addBOS: false, addEOS: false)
-        let addressedTokens: [llama_token]
-        if reusesAddressedPrefix {
-            var prefix = ""
-            for character in candidate.text {
-                let newPrefix = prefix + String(character)
-                if prefixConstraint.constraint.hasPrefix(newPrefix.utf8) {
-                    prefix = newPrefix
-                } else {
-                    break
-                }
-            }
-            addressedTokens = context.encode(prefix, addBOS: false, addEOS: false)
+        // [Hazkey Community Patch]
+        // 評価済み接頭辞の再利用、学習語の加点、ユーザ辞書の語・指定学習語の保護のいずれかが必要なときだけ
+        // candidateTokenPiecesを1回だけ生成して共有する
+        let needsLearnedPriorities = candidate.data.contains(where: { $0.metadata.contains(.isLearned) })
+        let needsUserDictionaryProtection = candidate.data.contains(where: wordProtection.protects)
+        let candidateTokenPieces: [[UInt8]] = if reusesAddressedPrefix || needsLearnedPriorities || needsUserDictionaryProtection {
+            candidateTokens.map { context.tokenToPiece(token: $0).map { UInt8(bitPattern: $0) } }
         } else {
-            addressedTokens = []
+            []
+        }
+        let addressedTokenCount = if reusesAddressedPrefix {
+            Self.reusableAddressedTokenCount(
+                candidateTokenPieces: candidateTokenPieces,
+                prefixConstraint: prefixConstraint,
+                normalize: context.normalizeForModel
+            )
+        } else {
+            0
         }
 
         let tokens = promptTokens + candidateTokens
-        let startOffset = promptTokens.count - 1 + addressedTokens.count
+        let startOffset = promptTokens.count - 1 + addressedTokenCount
         let n_vocab = Int(context.vocabSize)
-        let learnedTokenPriorities: [Float]?
-        if candidate.data.contains(where: { $0.metadata.contains(.isLearned) }) {
-            let candidateLearnedTokens = candidate.data.flatMap {
-                Array(
-                    repeating: $0.metadata.contains(.isLearned) ? logf(self.learningPriority(data: $0)) : 0,
-                    count: context.encode($0.word, addBOS: false).count
-                )
-            }
-            if candidateLearnedTokens.count >= candidateTokens.count {
-                learnedTokenPriorities = Array(candidateLearnedTokens.prefix(candidateTokens.count))
-            } else {
-                learnedTokenPriorities = candidateLearnedTokens + Array(
-                    repeating: 0,
-                    count: candidateTokens.count - candidateLearnedTokens.count
-                )
-            }
+        let learnedTokenPriorities: [Float]? = if needsLearnedPriorities {
+            Self.learnedTokenPriorities(
+                candidateText: candidate.text,
+                data: candidate.data,
+                candidateTokenPieces: candidateTokenPieces,
+                normalize: context.normalizeForModel
+            )
         } else {
-            learnedTokenPriorities = nil
+            nil
         }
         // [Hazkey Community Patch]
         // ユーザ辞書の語の範囲に収まる候補のトークン。位置は実際の candidateTokens の復号結果で決める
         // 要求で指定された学習語も、ユーザ辞書の語と同じく保護する (Kana2Kanji.ZenzaiWordProtection)
-        let userDictionaryProtection: UserDictionaryProtection? = if candidate.data.contains(where: wordProtection.protects) {
+        let userDictionaryProtection: UserDictionaryProtection? = if needsUserDictionaryProtection {
             Self.userDictionaryProtection(
                 candidateText: candidate.text,
                 data: candidate.data,
-                candidateTokenPieces: candidateTokens.map { context.tokenToPiece(token: $0).map { UInt8(bitPattern: $0) } },
+                candidateTokenPieces: candidateTokenPieces,
                 normalize: context.normalizeForModel,
                 isProtected: wordProtection.protects
             )
@@ -743,6 +747,196 @@ struct ZenzCandidateEvaluator {
         }
     }
 
+    // [Hazkey Community Patch]
+    /// 候補文字列と要素列とトークン復号片の整合を検証して位置合わせに必要な情報を返す
+    ///
+    /// 固定部分の除去でdataの先頭要素が固定部分を含む場合でも、先頭の余剰バイト数leadingDropCountを算出する
+    ///
+    /// 復号バイト列が正規化後の候補表記で始まらない場合は不整合としてnilを返す
+    ///
+    /// - Parameters:
+    ///   - candidateText: 評価対象の候補表記
+    ///   - data: 候補を構成する辞書要素列
+    ///   - candidateTokenPieces: 候補トークンごとの復号バイト列
+    ///   - normalize: モデルの比較空間へ文字列を正規化する関数
+    /// - Returns: 整合した場合は候補バイト列、先頭余剰バイト数、連結復号バイト列の組、不整合ならnil
+    private static func validatedTokenAlignment(
+        candidateText: String,
+        data: [DicdataElement],
+        candidateTokenPieces: [[UInt8]],
+        normalize: (String) -> String
+    ) -> (textBytes: [UInt8], leadingDropCount: Int, concatenatedPieces: [UInt8])? {
+        let joinedWords = Array(data.map(\.word).joined().utf8)
+        let textBytes = Array(candidateText.utf8)
+        guard joinedWords.count >= textBytes.count,
+              joinedWords.suffix(textBytes.count).elementsEqual(textBytes) else {
+            return nil
+        }
+        let leadingDropCount = joinedWords.count - textBytes.count
+        let concatenatedPieces = candidateTokenPieces.flatMap { $0 }
+        guard concatenatedPieces.starts(with: normalize(candidateText).utf8) else {
+            return nil
+        }
+        return (textBytes, leadingDropCount, concatenatedPieces)
+    }
+
+    // [Hazkey Community Patch]
+    /// 候補表記のUTF-8バイト位置をモデル用に正規化した復号バイト列の位置へ変換する
+    ///
+    /// 書記素の途中や、正規化が前後の語をまたいで復号列の先頭と一致しない位置はnilを返す
+    ///
+    /// - Parameters:
+    ///   - offset: 候補表記内のUTF-8バイト位置
+    ///   - candidateText: 評価対象の候補表記
+    ///   - concatenatedPieces: 候補トークンの復号バイト列を連結した配列
+    ///   - normalize: モデルの比較空間へ文字列を正規化する関数
+    /// - Returns: 正規化バイト列内の対応位置、対応させられない場合はnil
+    private static func normalizedOffset(
+        ofTextByteOffset offset: Int,
+        in candidateText: String,
+        concatenatedPieces: [UInt8],
+        normalize: (String) -> String
+    ) -> Int? {
+        let utf8Index = candidateText.utf8.index(candidateText.utf8.startIndex, offsetBy: offset)
+        guard let index = String.Index(utf8Index, within: candidateText) else {
+            return nil
+        }
+        let normalizedPrefix = normalize(String(candidateText[..<index])).utf8
+        guard concatenatedPieces.starts(with: normalizedPrefix) else {
+            return nil
+        }
+        return normalizedPrefix.count
+    }
+
+    // [Hazkey Community Patch]
+    /// 既存の先頭制約で評価済みとみなして省略できる候補トークン数を返す
+    ///
+    /// 制約文字列をモデルの正規化空間へ揃えた上で、実際のcandidateTokenPiecesの先頭から完全一致するトークンだけを数える
+    ///
+    /// サブワード分割の食い違いで未評価トークンを飛ばさないよう、部分一致や空ピースで直ちに打ち切る
+    ///
+    /// - Parameters:
+    ///   - candidateTokenPieces: 候補トークンごとの復号バイト列
+    ///   - prefixConstraint: 直前までに得られている先頭制約
+    ///   - normalize: モデルの比較空間へ文字列を正規化する関数
+    /// - Returns: 先頭から評価を省略できるトークン数 (0以上candidateTokenPieces.count以下)
+    static func reusableAddressedTokenCount(
+        candidateTokenPieces: [[UInt8]],
+        prefixConstraint: Kana2Kanji.PrefixConstraint,
+        normalize: (String) -> String
+    ) -> Int {
+        guard !prefixConstraint.constraint.isEmpty,
+              let constraintString = String(bytes: prefixConstraint.constraint, encoding: .utf8) else {
+            return 0
+        }
+        let normalizedConstraintBytes = Array(normalize(constraintString).utf8)
+        var consumedBytes = 0
+        var count = 0
+        for piece in candidateTokenPieces {
+            guard !piece.isEmpty,
+                  consumedBytes + piece.count <= normalizedConstraintBytes.count,
+                  normalizedConstraintBytes[consumedBytes ..< consumedBytes + piece.count].elementsEqual(piece) else {
+                break
+            }
+            consumedBytes += piece.count
+            count += 1
+        }
+        return count
+    }
+
+    // [Hazkey Community Patch]
+    /// 候補トークン列の各位置へ適用する学習語の加点配列を返す
+    ///
+    /// サブワードトークナイザで単語境界をまたぐ結合が起きても位置がずれないよう、実際のcandidateTokenPiecesの復号バイト範囲で判定する
+    ///
+    /// 連続する学習要素の和集合に完全に収まるトークンへ加点し、複数の学習要素をまたぐ場合は過大な加点を防ぐため最小値を採る
+    ///
+    /// 学習要素がない場合や復号バイト列と正規化表記の整合が取れない場合はnilを返す
+    ///
+    /// - Parameters:
+    ///   - candidateText: 評価対象の候補表記
+    ///   - data: 候補を構成する辞書要素列
+    ///   - candidateTokenPieces: 候補トークンごとの復号バイト列
+    ///   - normalize: モデルの比較空間へ文字列を正規化する関数
+    /// - Returns: 各トークンに対応する対数加点配列 (長さはcandidateTokenPieces.count)、適用不可ならnil
+    static func learnedTokenPriorities(
+        candidateText: String,
+        data: [DicdataElement],
+        candidateTokenPieces: [[UInt8]],
+        normalize: (String) -> String
+    ) -> [Float]? {
+        guard data.contains(where: { $0.metadata.contains(.isLearned) }) else {
+            return nil
+        }
+        guard let alignment = Self.validatedTokenAlignment(
+            candidateText: candidateText,
+            data: data,
+            candidateTokenPieces: candidateTokenPieces,
+            normalize: normalize
+        ) else {
+            return nil
+        }
+        struct LearnedRange {
+            var normalized: Range<Int>
+            var priority: Float
+        }
+        var learnedRanges: [LearnedRange] = []
+        var wordEnd = 0
+        for element in data {
+            let wordStart = max(0, wordEnd - alignment.leadingDropCount)
+            wordEnd += element.word.utf8.count
+            let clampedEnd = max(0, wordEnd - alignment.leadingDropCount)
+            guard element.metadata.contains(.isLearned),
+                  clampedEnd > wordStart,
+                  let lower = Self.normalizedOffset(
+                      ofTextByteOffset: wordStart,
+                      in: candidateText,
+                      concatenatedPieces: alignment.concatenatedPieces,
+                      normalize: normalize
+                  ),
+                  let upper = Self.normalizedOffset(
+                      ofTextByteOffset: clampedEnd,
+                      in: candidateText,
+                      concatenatedPieces: alignment.concatenatedPieces,
+                      normalize: normalize
+                  ),
+                  lower < upper else {
+                continue
+            }
+            learnedRanges.append(
+                LearnedRange(
+                    normalized: lower ..< upper,
+                    priority: logf(Self.learningPriority(data: element))
+                )
+            )
+        }
+        var pieceStart = 0
+        return candidateTokenPieces.map { piece in
+            let pieceRange = pieceStart ..< pieceStart + piece.count
+            pieceStart += piece.count
+            guard !piece.isEmpty else {
+                return 0
+            }
+            // 途切れのない学習要素の並びでpieceRange全体が覆われる場合だけ加点を与える
+            var coveredEnd = pieceRange.lowerBound
+            var minPriority: Float?
+            for range in learnedRanges {
+                if range.normalized.upperBound <= coveredEnd {
+                    continue
+                }
+                if range.normalized.lowerBound > coveredEnd {
+                    break
+                }
+                coveredEnd = min(pieceRange.upperBound, range.normalized.upperBound)
+                minPriority = minPriority.map { min($0, range.priority) } ?? range.priority
+                if coveredEnd == pieceRange.upperBound {
+                    break
+                }
+            }
+            return coveredEnd == pieceRange.upperBound ? (minPriority ?? 0) : 0
+        }
+    }
+
     static func userDictionaryProtection(
         candidateText: String,
         data: [DicdataElement],
@@ -753,38 +947,33 @@ struct ZenzCandidateEvaluator {
         guard data.contains(where: isProtected) else {
             return nil
         }
-        // 固定された表記を除いた候補では、dataの先頭の語が固定部分を含むことがある
-        let joinedWords = Array(data.map(\.word).joined().utf8)
-        let textBytes = Array(candidateText.utf8)
-        guard joinedWords.count >= textBytes.count,
-              joinedWords.suffix(textBytes.count).elementsEqual(textBytes) else {
+        guard let alignment = Self.validatedTokenAlignment(
+            candidateText: candidateText,
+            data: data,
+            candidateTokenPieces: candidateTokenPieces,
+            normalize: normalize
+        ) else {
             return nil
         }
-        let leadingDropCount = joinedWords.count - textBytes.count
-
-        let concatenatedPieces = candidateTokenPieces.flatMap { $0 }
-        guard concatenatedPieces.starts(with: normalize(candidateText).utf8) else {
-            return nil
-        }
-        // 候補の表記のバイト位置を、モデル用に正規化して符号化した列のバイト位置へ移す
-        // 書記素の途中や、正規化が前後の語をまたぐ位置は対応させられないので、その範囲を保護対象から外す
-        func normalizedOffset(ofTextByteOffset offset: Int) -> Int? {
-            let utf8Index = candidateText.utf8.index(candidateText.utf8.startIndex, offsetBy: offset)
-            guard let index = String.Index(utf8Index, within: candidateText) else {
-                return nil
-            }
-            let normalizedPrefix = normalize(String(candidateText[..<index])).utf8
-            guard concatenatedPieces.starts(with: normalizedPrefix) else {
-                return nil
-            }
-            return normalizedPrefix.count
-        }
+        let textBytes = alignment.textBytes
+        let leadingDropCount = alignment.leadingDropCount
+        let concatenatedPieces = alignment.concatenatedPieces
 
         // 連続するユーザ辞書の語は1つの範囲にまとめ、語の間をまたぐトークンも保護する
         var protectedRanges: [UserDictionaryProtection.SurfaceRange] = []
         func appendProtectedRange(textByteRange: Range<Int>) {
-            if let lower = normalizedOffset(ofTextByteOffset: textByteRange.lowerBound),
-               let upper = normalizedOffset(ofTextByteOffset: textByteRange.upperBound),
+            if let lower = Self.normalizedOffset(
+                ofTextByteOffset: textByteRange.lowerBound,
+                in: candidateText,
+                concatenatedPieces: concatenatedPieces,
+                normalize: normalize
+            ),
+               let upper = Self.normalizedOffset(
+                ofTextByteOffset: textByteRange.upperBound,
+                in: candidateText,
+                concatenatedPieces: concatenatedPieces,
+                normalize: normalize
+               ),
                lower < upper {
                 protectedRanges.append(.init(normalized: lower ..< upper, surface: Array(textBytes[textByteRange])))
             }
@@ -819,7 +1008,7 @@ struct ZenzCandidateEvaluator {
         return UserDictionaryProtection(tokenMask: tokenMask, surfaceRanges: protectedRanges)
     }
 
-    private static func learningPriority(data: DicdataElement) -> Float {
+    static func learningPriority(data: DicdataElement) -> Float {
         // 文字数の長い候補ほど優先的に適用されるようにする
         // 積極的な複合語化の効果を期待
         if 1 <= data.ruby.count && data.ruby.count <= 4 {

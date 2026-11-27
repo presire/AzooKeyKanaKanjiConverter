@@ -50,10 +50,21 @@ enum ZenzPromptBuilder {
         return conditions
     }
 
+    /// 入力予測用のプロンプト文字列を構築する
+    ///
+    /// v3モード以外が指定された場合はnilを返す
+    ///
+    /// - Parameters:
+    ///   - leftSideContext: 左文脈の文字列
+    ///   - composingText: 入力中の文字列
+    ///   - versionDependentConfig: Zenzaiのバージョン依存設定
+    ///   - alwaysEmitContextTag: 左文脈が空の場合でもコンテキストタグU+EE02を常に出力するかどうか
+    /// - Returns: 構築したプロンプト文字列 (非対応バージョンではnil)
     static func inputPredictionPrompt(
         leftSideContext: String,
         composingText: String,
-        versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode
+        versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
+        alwaysEmitContextTag: Bool = false
     ) -> String? {
         guard case let .v3(mode) = versionDependentConfig else {
             return nil
@@ -63,7 +74,9 @@ enum ZenzPromptBuilder {
         let trimmedRightContext = self.trimmedRightContext(mode.rightSideContext, maxLength: mode.maxRightSideContextLength)
         let input = composingText.toKatakana()
         var prompt = conditions.joined(separator: "")
-        if !trimmedLeftContext.isEmpty {
+        // [Hazkey Community Patch]
+        // Jinenモデルでは左文脈が空でもコンテキストタグU+EE02を前置する
+        if alwaysEmitContextTag || !trimmedLeftContext.isEmpty {
             prompt += contextTag + trimmedLeftContext
         }
         if !trimmedRightContext.isEmpty {
@@ -80,11 +93,23 @@ enum ZenzPromptBuilder {
         }
     }
 
+    /// 候補評価用のプロンプト文字列を構築する
+    ///
+    /// v2モードとv3モードでタグ配置を切り替える
+    ///
+    /// - Parameters:
+    ///   - input: 評価対象の読み文字列
+    ///   - inputCursorPosition: 読み内のカーソル位置
+    ///   - userDictionaryPrompt: v2モード向けのユーザ辞書プロンプト文字列
+    ///   - versionDependentConfig: Zenzaiのバージョン依存設定
+    ///   - alwaysEmitContextTag: v3モードで左文脈が空の場合でもコンテキストタグU+EE02を常に出力するかどうか
+    /// - Returns: 構築したプロンプト文字列
     static func candidateEvaluationPrompt(
         input: String,
         inputCursorPosition: Int? = nil,
         userDictionaryPrompt: String,
-        versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode
+        versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
+        alwaysEmitContextTag: Bool = false
     ) -> String {
         var conditions: [String] = []
 
@@ -122,7 +147,9 @@ enum ZenzPromptBuilder {
             }
         case .v3:
             var prompt = conditions.joined(separator: "")
-            if !leftSideContext.isEmpty {
+            // [Hazkey Community Patch]
+            // Jinenモデルでは左文脈が空でもコンテキストタグU+EE02を前置する
+            if alwaysEmitContextTag || !leftSideContext.isEmpty {
                 prompt += contextTag + leftSideContext
             }
             if !rightSideContext.isEmpty {

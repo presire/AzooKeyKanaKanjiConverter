@@ -129,6 +129,12 @@ final class HazkeyZenzaiUserDictionaryConstraintTests: XCTestCase {
         }
     }
 
+    func testGetReplaceableConstraintStopsAtFirstMismatchedSegment() {
+        let cache = Self.cache(evaluated: "あい", candidate: [("A", "ア"), ("B", "イ")])
+        let constraint = cache.getNewConstraint(for: Self.composingText("い"), userDictionary: [])
+        XCTAssertEqual(constraint.constraint, [])
+    }
+
     private static let yuuki = DicdataElement(
         word: "結城",
         ruby: "ユウキ",

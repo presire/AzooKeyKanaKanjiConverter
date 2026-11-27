@@ -25,10 +25,13 @@ struct ZenzInputTextGenerator {
         let effectiveConfig = context.isJinenModel
             ? ZenzCandidateEvaluator.jinenAdjustedMode(versionDependentConfig)
             : versionDependentConfig
+        // [Hazkey Community Patch]
+        // jinenでは左文脈が空の場合でもコンテキストタグU+EE02を常時付与する
         guard let prompt = ZenzPromptBuilder.inputPredictionPrompt(
             leftSideContext: leftSideContext,
             composingText: composingText,
-            versionDependentConfig: effectiveConfig
+            versionDependentConfig: effectiveConfig,
+            alwaysEmitContextTag: context.isJinenModel
         ) else {
             return ""
         }
@@ -51,6 +54,11 @@ struct ZenzInputTextGenerator {
         // [Hazkey Community Patch]
         // jinen (Qwen3) 系はBOSを付けずに学習されているため符号化時にBOSを付けない
         var promptTokens = context.encode(prompt, addBOS: !context.isJinenModel, addEOS: false)
+        // [Hazkey Community Patch]
+        // addBOS=falseでトークン化が失敗し空配列になった場合は推論を行わずに終了する
+        guard !promptTokens.isEmpty else {
+            return ""
+        }
         let minLength = max(1, min(minLength, count))
         let vocabSize = Int(context.vocabSize)
         let stopCharacters: Set<Character> = ["、", "。", "！", "？"]

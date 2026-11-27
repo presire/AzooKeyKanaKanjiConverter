@@ -1504,17 +1504,80 @@ final class ZenzContext {
         // replace newline into null for zenz tokenizer
         text.replacingOccurrences(of: " ", with: "\u{3000}").replacingOccurrences(of: "\n", with: "")
     }
+    // [Hazkey Community Patch]
+    /// バッファ不足時に必要サイズで1回だけ再確保しながらトークン化を実行する
+    ///
+    /// JinenのSentencePieceトークナイザでは半角空白が3トークンへ展開されるなどUTF-8バイト数を超える場合がある
+    ///
+    /// 初回の呼び出しで負の必要トークン数が返った場合は上限の範囲内で再確保して再実行し、失敗時はnilを返す
+    ///
+    /// - Parameters:
+    ///   - utf8Count: 入力文字列のUTF-8バイト数
+    ///   - addBOS: 先頭にBOSトークンを付与するか
+    ///   - tokenizeInto: 確保済みバッファと容量を受け取りllama_tokenizeの戻り値を返すクロージャ
+    /// - Returns: トークン化に成功した場合はトークン列、失敗した場合はnil
+    static func tokenizeWithRetry(
+        utf8Count: Int,
+        addBOS: Bool,
+        tokenizeInto: (UnsafeMutablePointer<llama_token>, Int32) -> Int32
+    ) -> [llama_token]? {
+        guard utf8Count >= 0 else {
+            return nil
+        }
+        if utf8Count == 0 && !addBOS {
+            return []
+        }
+        let bosSlack = addBOS ? 1 : 0
+        guard utf8Count <= Int(Int32.max) - bosSlack else {
+            return nil
+        }
+        let initialCapacity = max(1, utf8Count + bosSlack)
+        let initialTokens = UnsafeMutablePointer<llama_token>.allocate(capacity: initialCapacity)
+        defer {
+            initialTokens.deallocate()
+        }
+        let tokenCount = tokenizeInto(initialTokens, Int32(initialCapacity))
+        if tokenCount >= 0 {
+            let count = min(Int(tokenCount), initialCapacity)
+            return Array(UnsafeBufferPointer(start: initialTokens, count: count))
+        }
+        guard tokenCount != Int32.min else {
+            return nil
+        }
+        let requiredCapacity = Int(-tokenCount)
+        let maxAllowedCapacity = min(Int(Int32.max), max(1024, utf8Count * 4 + 16))
+        guard requiredCapacity > initialCapacity,
+              requiredCapacity <= maxAllowedCapacity else {
+            return nil
+        }
+        let retryTokens = UnsafeMutablePointer<llama_token>.allocate(capacity: requiredCapacity)
+        defer {
+            retryTokens.deallocate()
+        }
+        let retryCount = tokenizeInto(retryTokens, Int32(requiredCapacity))
+        guard retryCount >= 0, Int(retryCount) <= requiredCapacity else {
+            return nil
+        }
+        return Array(UnsafeBufferPointer(start: retryTokens, count: Int(retryCount)))
+    }
+
     private func tokenize(text: String, add_bos: Bool, add_eos: Bool = false) -> [llama_token] {
         let utf8Count = text.utf8.count
-        let n_tokens = utf8Count + (add_bos ? 1 : 0)
-        let tokens = UnsafeMutablePointer<llama_token>.allocate(capacity: n_tokens)
-        let tokenCount = llama_tokenize(self.sharedModel.vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, false)
-        var swiftTokens: [llama_token] = if tokenCount < 0 {
-            [llama_vocab_bos(self.sharedModel.vocab)]
+        var swiftTokens: [llama_token]
+        // [Hazkey Community Patch]
+        // バッファ不足時は必要サイズで再確保し、失敗時もadd_bosがfalseならBOSを混入させない
+        if let tokenized = Self.tokenizeWithRetry(
+            utf8Count: utf8Count,
+            addBOS: add_bos,
+            tokenizeInto: { buffer, capacity in
+                Int32(llama_tokenize(self.sharedModel.vocab, text, Int32(utf8Count), buffer, capacity, add_bos, false))
+            }
+        ) {
+            swiftTokens = tokenized
         } else {
-            (0..<tokenCount).map {tokens[Int($0)]}
+            debug("tokenize failed for utf8Count=\(utf8Count), addBOS=\(add_bos)")
+            swiftTokens = add_bos ? [llama_vocab_bos(self.sharedModel.vocab)] : []
         }
-        tokens.deallocate()
         if add_eos {
             swiftTokens.append(llama_vocab_eos(self.sharedModel.vocab))
         }
