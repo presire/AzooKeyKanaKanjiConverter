@@ -96,13 +96,289 @@ extension Kana2Kanji {
         return segment
     }
 
-    // Compute matched bytes with constraint and total candidate bytes for (prev-chain + currentWord)
+    // [Hazkey Community Patch]
+    /// JinenのNFKC制約照合で使う比較用セグメントを呼び出し単位で保持するキャッシュ
+    ///
+    /// 同じラティスでも経路ごとに直前までの比較バイト数が異なるため、ノード単体ではなく
+    /// ノードと分割位置の組でセグメントを再利用する
+    ///
+    /// 保存先は変換呼び出しごとに生成するローカル値であり、変換結果には影響しない
+    struct JinenComparisonSegmentCache {
+        /// 分割セグメントのキー
+        ///
+        /// 同じノードでもfixedPrefixの境界で切り取る位置が異なれば別のセグメントになる
+        private struct SplitKey: Hashable {
+            /// 対象ノードの識別子
+            let nodeID: ObjectIdentifier
+            /// ノード表記の生UTF-8先頭から境界までに含めるバイト数
+            let rawTakeCount: Int
+        }
+
+        /// 全セグメントを連結して保持する追記専用のバイト列
+        ///
+        /// 全体セグメントと分割セグメントの両方を格納する
+        ///
+        /// 分割セグメントの登録は preparedFullSegmentStorage による全体セグメント用の容量確保より先に起きる場合がある
+        ///
+        /// Zenz経路は全体セグメントも分割セグメントも書かないため、キャッシュ生成だけではヒープ確保を発生させない
+        ///
+        /// ヒット時は範囲を取り出すだけでヒープ確保と配列の参照カウント操作を発生させない
+        private var storage: [UInt8] = []
+
+        /// ノード識別子から全体セグメント範囲を引く呼び出し単位の表
+        ///
+        /// 標準の辞書はハッシュ計算とバケット管理の分だけ引き当てが重く、同じ変換呼び出しで
+        /// 何万回も引かれるため、識別子をそのまま索引にできる開番地法の表を自前で持つ
+        private var fullRangeTable = NodeRangeTable()
+
+        /// ノード表記の生UTF-8バイト列ごとの全体セグメント範囲
+        ///
+        /// FoundationのNFKC出力は、Swiftが正準等価とみなす文字列の間でも異なるバイト列になる場合がある
+        ///
+        /// 文字列の等値判定をキーにすると異なる生バイト列が同じ範囲へ統合されるため、生UTF-8バイト列をキーにする
+        ///
+        /// まず fullRangeTable を引き、外れた場合だけ生UTF-8バイト列をキーにこの表を引く
+        ///
+        /// 容量は最初の全体セグメント登録まで確保しない
+        private var fullRangeByRawUTF8: [[UInt8]: Range<Int>] = [:]
+
+        /// ノード識別子と切り取り位置の組ごとの分割セグメント範囲
+        private var splitRangeByKey: [SplitKey: Range<Int>] = [:]
+
+        /// 全体セグメント用の容量を確保済みかを示す印
+        ///
+        /// 確保を最初の全体セグメント登録まで遅らせ、Zenz経路の生成コストを増やさない
+        private var preparedFullSegmentStorage = false
+
+        /// ノード識別子から全体セグメント範囲を引く呼び出し単位の表
+        ///
+        /// 標準の辞書と同じ識別子キーでも、呼び出しごとに捨てる表ではハッシュの汎用処理が
+        /// そのまま費用になるため、識別子のビット列を直接索引へ写す表を持つ
+        ///
+        /// 表は最初の登録まで配列を確保せず、Zenz経路では生成するだけでヒープを使わない
+        private struct NodeRangeTable {
+            /// 格納済みのノード識別子で、0を空きスロットの番人にする
+            private var keys: [UInt] = []
+
+            /// keysと同じ位置に並ぶセグメント範囲
+            private var ranges: [Range<Int>] = []
+
+            /// 格納済みの件数
+            private var count = 0
+
+            /// 最初の登録時に確保するスロット数
+            private static let initialCapacity = 2048
+
+            /// キーを容量内の開始スロットへ写す
+            ///
+            /// 容量は2の冪なので、64ビットの黄金比乗算の上位ビットだけで一様な索引になる
+            ///
+            /// 乗算とシフトの前に UInt64 へ広げるため、UInt が32ビットの環境 (Android armv7 など) でも桁あふれしない
+            ///
+            /// - Parameters:
+            ///   - key: 写像するノード識別子
+            ///   - capacity: 現在のスロット数
+            /// - Returns: 探索を始めるスロット番号
+            private static func bucketIndex(for key: UInt, capacity: Int) -> Int {
+                let shift = 64 - capacity.trailingZeroBitCount
+                return Int((UInt64(key) &* 0x9E37_79B9_7F4A_7C15) >> shift)
+            }
+
+            /// 登録済みのセグメント範囲を返す
+            ///
+            /// 開始スロットから線形に進み、空きスロットに達したら未登録と判断する
+            ///
+            /// - Parameter node: 照合対象のラティスノード
+            /// - Returns: 登録済みの範囲またはnil
+            func range(for node: LatticeNode) -> Range<Int>? {
+                let key = UInt(bitPattern: ObjectIdentifier(node))
+                guard key != 0, !self.keys.isEmpty else {
+                    return nil
+                }
+                let mask = self.keys.count - 1
+                var index = Self.bucketIndex(for: key, capacity: self.keys.count)
+                while true {
+                    let storedKey = self.keys[index]
+                    if storedKey == key {
+                        return self.ranges[index]
+                    }
+                    if storedKey == 0 {
+                        return nil
+                    }
+                    index = (index + 1) & mask
+                }
+            }
+
+            /// セグメント範囲を登録する
+            ///
+            /// 件数が容量の半分に達したら倍へ広げ、既存の全件を移し直して引き当てを保つ
+            ///
+            /// - Parameters:
+            ///   - range: 登録するセグメント範囲
+            ///   - node: 範囲の対象となるラティスノード
+            mutating func insert(_ range: Range<Int>, for node: LatticeNode) {
+                let key = UInt(bitPattern: ObjectIdentifier(node))
+                guard key != 0 else {
+                    return
+                }
+                if self.keys.isEmpty {
+                    self.resize(to: Self.initialCapacity)
+                } else if self.count * 2 >= self.keys.count {
+                    self.resize(to: self.keys.count * 2)
+                }
+                self.store(range, key: key)
+            }
+
+            /// 空きスロットが見つかるまで線形に探して書き込む
+            ///
+            /// 書き込みの前に件数が容量の半分未満であるため空きスロットは必ず存在する
+            ///
+            /// - Parameters:
+            ///   - range: 登録するセグメント範囲
+            ///   - key: 登録するノード識別子
+            private mutating func store(_ range: Range<Int>, key: UInt) {
+                let mask = self.keys.count - 1
+                var index = Self.bucketIndex(for: key, capacity: self.keys.count)
+                while self.keys[index] != 0, self.keys[index] != key {
+                    index = (index + 1) & mask
+                }
+                if self.keys[index] == 0 {
+                    self.keys[index] = key
+                    self.count += 1
+                }
+                self.ranges[index] = range
+            }
+
+            /// 容量を指定値へ広げて全件を移し直す
+            ///
+            /// 移し直しは既存のキーを順に再配置するため、元の並び順に依存しない
+            ///
+            /// - Parameter newCapacity: 新しいスロット数
+            private mutating func resize(to newCapacity: Int) {
+                let oldKeys = self.keys
+                let oldRanges = self.ranges
+                self.keys = Array(repeating: 0, count: newCapacity)
+                self.ranges = Array(repeating: 0 ..< 0, count: newCapacity)
+                self.count = 0
+                let mask = newCapacity - 1
+                for index in oldKeys.indices where oldKeys[index] != 0 {
+                    let key = oldKeys[index]
+                    var newIndex = Self.bucketIndex(for: key, capacity: newCapacity)
+                    while self.keys[newIndex] != 0 {
+                        newIndex = (newIndex + 1) & mask
+                    }
+                    self.keys[newIndex] = key
+                    self.ranges[newIndex] = oldRanges[index]
+                    self.count += 1
+                }
+            }
+        }
+
+        /// 指定ノードの比較用セグメント範囲を返す
+        ///
+        /// ノード全体がfixedPrefixの外にある場合はNFKC適用後のセグメントを返す
+        ///
+        /// prevTotalと生UTF-8バイト数の和がfixedByteCount以下になる場合はnilを返し、呼び出し側に生UTF-8の直接照合を委ねる
+        ///
+        /// ノードがfixedPrefixの境界をまたぐ場合は境界の手前を生UTF-8、後ろをNFKCにしたセグメントを返す
+        ///
+        /// 境界が文字の内側を切る場合は生バイトのまま保持し、境界をまたいで文字を合成しない (normalizedComparisonSegment と同じ規則)
+        ///
+        /// - Parameters:
+        ///   - node: 比較対象のラティスノード
+        ///   - prevTotal: 直前ノードまでの比較空間における累積バイト数
+        ///   - fixedByteCount: 先頭の生UTF-8固定区間のバイト数
+        /// - Returns: セグメントの格納範囲またはnil
+        mutating func segmentRange(for node: LatticeNode, prevTotal: Int, fixedByteCount: Int) -> Range<Int>? {
+            let word = node.data.word
+            if fixedByteCount == 0 || prevTotal >= fixedByteCount {
+                if let range = self.fullRangeTable.range(for: node) {
+                    return range
+                }
+                let rawBytes = Array(word.utf8)
+                if let range = self.fullRangeByRawUTF8[rawBytes] {
+                    self.fullRangeTable.insert(range, for: node)
+                    return range
+                }
+                if !self.preparedFullSegmentStorage {
+                    self.preparedFullSegmentStorage = true
+                    self.storage.reserveCapacity(4096)
+                    self.fullRangeByRawUTF8.reserveCapacity(512)
+                }
+                let start = self.storage.count
+                if rawBytes.allSatisfy({ $0 < 0x80 }) {
+                    self.storage.append(contentsOf: rawBytes)
+                } else {
+                    self.storage.append(contentsOf: word.precomposedStringWithCompatibilityMapping.utf8)
+                }
+                let range = start ..< self.storage.count
+                self.fullRangeByRawUTF8[rawBytes] = range
+                self.fullRangeTable.insert(range, for: node)
+                return range
+            }
+            let rawCount = word.utf8.count
+            if prevTotal + rawCount <= fixedByteCount {
+                return nil
+            }
+            let rawTakeCount = fixedByteCount - prevTotal
+            let key = SplitKey(nodeID: ObjectIdentifier(node), rawTakeCount: rawTakeCount)
+            if let range = self.splitRangeByKey[key] {
+                return range
+            }
+            let segment = Kana2Kanji.normalizedComparisonSegment(
+                prevTotal: prevTotal,
+                word: word,
+                fixedByteCount: fixedByteCount
+            )
+            let start = self.storage.count
+            self.storage.append(contentsOf: segment)
+            let range = start ..< self.storage.count
+            self.splitRangeByKey[key] = range
+            return range
+        }
+
+        /// 全体セグメント範囲の表に指定ノードが登録済みかを返す
+        ///
+        /// 表から引けないノードは生UTF-8バイト列の表からの引き当てへ進むため、表の保持を直接確かめられるようにする
+        ///
+        /// - Parameter node: 対象のラティスノード
+        /// - Returns: 全体セグメント範囲を保持していればtrue
+        internal func containsFullRangeNode(_ node: LatticeNode) -> Bool {
+            self.fullRangeTable.range(for: node) != nil
+        }
+
+        /// 格納範囲に対応するセグメントのバイト列を返す
+        ///
+        /// - Parameter range: segmentRangeで取得した格納範囲
+        /// - Returns: セグメントのバイト列
+        func bytes(in range: Range<Int>) -> ArraySlice<UInt8> {
+            self.storage[range]
+        }
+    }
+
+    /// 制約と候補の一致バイト数と累積バイト数を計算する
+    ///
+    /// Zenz経路は生UTF-8のまま照合し、Jinen経路だけが比較用セグメントを使う
+    ///
+    /// Jinen経路のセグメントは呼び出し単位のキャッシュから取得し、同じノードと同じ境界の再計算を避ける
+    ///
+    /// - Parameters:
+    ///   - prev: 直前の登録ノード
+    ///   - currentWord: 現在ノードの辞書表記
+    ///   - currentNode: 現在のラティスノード
+    ///   - constraintBytes: 照合空間へ変換済みの実効制約バイト列
+    ///   - normalizesUnfixedForJinen: JinenのNFKC照合が有効か
+    ///   - fixedByteCount: 先頭の生UTF-8固定区間のバイト数
+    ///   - segmentCache: 比較用セグメントの呼び出し単位キャッシュ
+    /// - Returns: 一致バイト数と累積バイト数
     private func computeMatchedAndTotalLength(
         prev: borrowing RegisteredNode?,
         currentWord: borrowing String,
+        currentNode: borrowing LatticeNode,
         constraintBytes: borrowing [UInt8],
         normalizesUnfixedForJinen: Bool,
-        fixedByteCount: Int
+        fixedByteCount: Int,
+        segmentCache: inout JinenComparisonSegmentCache
     ) -> (matched: Int, total: Int) {
         let previousTotal = prev.map { Int($0.candidateUTF8Count) } ?? 0
         var matched = prev.map { Int($0.constraintMatchedUTF8Count) } ?? 0
@@ -123,17 +399,41 @@ extension Kana2Kanji {
             return (matched, total)
         }
         // [Hazkey Community Patch]
+        // 一致数が制約長へ達し累積も固定区間を越えた後は、後続バイトの比較で一致数は増えない
+        // 一致判定と終端判定も変わらないため、セグメントを作らずに素通しする
+        // 返す累積長はNFKC後の正確な長さではなく生UTF-8バイト数になる
+        // 下流の判定は制約長と固定区間長との比較だけを行い、NFKCは空でない表記を空へ写さないため挙動は変わらない
+        if matched >= constraintBytes.count, previousTotal >= max(fixedByteCount, constraintBytes.count) {
+            return (matched, previousTotal + currentNode.data.word.utf8.count)
+        }
+        // [Hazkey Community Patch]
         // Jinenの未固定制約はNFKC空間で比較し、fixedPrefix区間だけは生UTF-8を維持する
-        let segment = Self.normalizedComparisonSegment(
+        // セグメントは呼び出し単位のキャッシュから取得し、同じノードと同じ境界の再計算を避ける
+        if let segmentRange = segmentCache.segmentRange(
+            for: currentNode,
             prevTotal: previousTotal,
-            word: currentWord,
             fixedByteCount: fixedByteCount
-        )
-        let total = previousTotal + segment.count
+        ) {
+            let segment = segmentCache.bytes(in: segmentRange)
+            let total = previousTotal + segment.count
+            guard matched == min(previousTotal, constraintBytes.count) else {
+                return (matched, total)
+            }
+            for byte in segment {
+                guard matched < constraintBytes.count, byte == constraintBytes[matched] else {
+                    break
+                }
+                matched += 1
+            }
+            return (matched, total)
+        }
+        // ノード全体がfixedPrefixの内側にある場合は生UTF-8を確保せずに直接照合する
+        let rawBytes = currentNode.data.word.utf8
+        let total = previousTotal + rawBytes.count
         guard matched == min(previousTotal, constraintBytes.count) else {
             return (matched, total)
         }
-        for byte in segment {
+        for byte in rawBytes {
             guard matched < constraintBytes.count, byte == constraintBytes[matched] else {
                 break
             }
@@ -148,14 +448,31 @@ extension Kana2Kanji {
         matched >= min(total, fixedByteCount)
     }
 
-    // Extend match with next word starting from current matched index
+    /// 次のノードを加えたときの一致バイト数と加算バイト数を計算する
+    ///
+    /// Zenz経路は生UTF-8のまま照合し、Jinen経路だけが比較用セグメントを使う
+    ///
+    /// Jinen経路のセグメントは呼び出し単位のキャッシュから取得し、computeMatchedAndTotalLengthと同じ比較空間を共有する
+    ///
+    /// - Parameters:
+    ///   - matched: 直前ノードまでの一致バイト数
+    ///   - previousTotal: 直前ノードまでの比較空間における累積バイト数
+    ///   - nextWord: 次ノードの辞書表記
+    ///   - nextNode: 次のラティスノード
+    ///   - constraintBytes: 照合空間へ変換済みの実効制約バイト列
+    ///   - normalizesUnfixedForJinen: JinenのNFKC照合が有効か
+    ///   - fixedByteCount: 先頭の生UTF-8固定区間のバイト数
+    ///   - segmentCache: 比較用セグメントの呼び出し単位キャッシュ
+    /// - Returns: 一致バイト数、不一致の有無、加算バイト数
     private func extendMatched(
         matched: Int,
         previousTotal: Int,
         nextWord: borrowing String,
+        nextNode: borrowing LatticeNode,
         constraintBytes: borrowing [UInt8],
         normalizesUnfixedForJinen: Bool,
-        fixedByteCount: Int
+        fixedByteCount: Int,
+        segmentCache: inout JinenComparisonSegmentCache
     ) -> (matched: Int, mismatch: Bool, addedLength: Int) {
         if !normalizesUnfixedForJinen {
             let nextLength = nextWord.utf8.count
@@ -175,18 +492,46 @@ extension Kana2Kanji {
             return (ci, false, nextLength)
         }
         // [Hazkey Community Patch]
+        // 一致数が制約長へ達し累積も固定区間を越えた後は、後続バイトの比較で一致数は増えず
+        // 不一致にもならないため、セグメントを作らずに素通しする
+        // 返す加算長はNFKC後の正確な長さではなく生UTF-8バイト数になる
+        // 下流の判定は制約長と固定区間長との比較だけを行い、NFKCは空でない表記を空へ写さないため挙動は変わらない
+        if matched >= constraintBytes.count, previousTotal >= max(fixedByteCount, constraintBytes.count) {
+            return (matched, false, nextNode.data.word.utf8.count)
+        }
+        // [Hazkey Community Patch]
         // Jinen時はcomputeMatchedAndTotalLengthと同一の比較空間で一致と加算バイト数を算出する
-        let segment = Self.normalizedComparisonSegment(
+        // セグメントは呼び出し単位のキャッシュから取得し、同じノードと同じ境界の再計算を避ける
+        if let segmentRange = segmentCache.segmentRange(
+            for: nextNode,
             prevTotal: previousTotal,
-            word: nextWord,
             fixedByteCount: fixedByteCount
-        )
-        let nextLength = segment.count
+        ) {
+            let segment = segmentCache.bytes(in: segmentRange)
+            let nextLength = segment.count
+            var ci = matched
+            if ci >= constraintBytes.count {
+                return (ci, false, nextLength)
+            }
+            for b in segment {
+                if ci >= constraintBytes.count {
+                    return (ci, false, nextLength)
+                }
+                if b != constraintBytes[ci] {
+                    return (ci, true, nextLength)
+                }
+                ci += 1
+            }
+            return (ci, false, nextLength)
+        }
+        // ノード全体がfixedPrefixの内側にある場合は生UTF-8を確保せずに直接照合する
+        let rawBytes = nextNode.data.word.utf8
+        let nextLength = rawBytes.count
         var ci = matched
         if ci >= constraintBytes.count {
             return (ci, false, nextLength)
         }
-        for b in segment {
+        for b in rawBytes {
             if ci >= constraintBytes.count {
                 return (ci, false, nextLength)
             }
@@ -263,6 +608,10 @@ extension Kana2Kanji {
         let constraintBytes = Self.effectiveConstraintBytes(for: constraint, fixedByteCount: fixedByteCount)
         let constraintLength = constraintBytes.count
         // [Hazkey Community Patch]
+        // Jinenの比較用セグメントはこの変換呼び出しの中だけで共有する
+        // 同じノードと同じ境界の再計算を避けつつ、呼び出しをまたぐ状態を持たないため変換結果は変わらない
+        var jinenSegmentCache = JinenComparisonSegmentCache()
+        // [Hazkey Community Patch]
         // 学習語の制約免除を外して再試行するとき (ignoreMemoryAndUserDictionary) は学習語にも制約をかける。ユーザ辞書の語は従来どおりモデル由来の制約を免除する (固定表記は掛ける)。
         // 上流は再試行で全ノードの制約を外しており、同じ学習語が再び選ばれていた。
         let constraintExemptMetadata: DicdataElementMetadata = constraint.ignoreMemoryAndUserDictionary ? [.isFromUserDictionary] : [.isLearned, .isFromUserDictionary]
@@ -284,9 +633,11 @@ extension Kana2Kanji {
                     let matchState = self.computeMatchedAndTotalLength(
                         prev: previous,
                         currentWord: node.data.word,
+                        currentNode: node,
                         constraintBytes: constraintBytes,
                         normalizesUnfixedForJinen: normalizesUnfixedForJinen,
-                        fixedByteCount: fixedByteCount
+                        fixedByteCount: fixedByteCount,
+                        segmentCache: &jinenSegmentCache
                     )
                     if nextIndex.surfaceIndex == surfaceCount {
                         if node.data.metadata.isDisjoint(with: constraintExemptMetadata) {
@@ -331,9 +682,11 @@ extension Kana2Kanji {
                                 matched: matchState.matched,
                                 previousTotal: matchState.total,
                                 nextWord: nextNode.data.word,
+                                nextNode: nextNode,
                                 constraintBytes: constraintBytes,
                                 normalizesUnfixedForJinen: normalizesUnfixedForJinen,
-                                fixedByteCount: fixedByteCount
+                                fixedByteCount: fixedByteCount,
+                                segmentCache: &jinenSegmentCache
                             )
                             if mismatch {
                                 continue
@@ -355,9 +708,11 @@ extension Kana2Kanji {
                                 matched: matchState.matched,
                                 previousTotal: matchState.total,
                                 nextWord: nextNode.data.word,
+                                nextNode: nextNode,
                                 constraintBytes: constraintBytes,
                                 normalizesUnfixedForJinen: normalizesUnfixedForJinen,
-                                fixedByteCount: fixedByteCount
+                                fixedByteCount: fixedByteCount,
+                                segmentCache: &jinenSegmentCache
                             )
                             let newTotal = matchState.total + nextLength
                             guard self.matchesFixedPrefix(matched: matched, total: newTotal, fixedByteCount: fixedByteCount) else {
@@ -395,9 +750,11 @@ extension Kana2Kanji {
                         self.computeMatchedAndTotalLength(
                             prev: node.prevs[idx],
                             currentWord: node.data.word,
+                            currentNode: node,
                             constraintBytes: constraintBytes,
                             normalizesUnfixedForJinen: normalizesUnfixedForJinen,
-                            fixedByteCount: fixedByteCount
+                            fixedByteCount: fixedByteCount,
+                            segmentCache: &jinenSegmentCache
                         )
                     }
                     for index in node.prevs.indices {
@@ -439,9 +796,11 @@ extension Kana2Kanji {
                         self.computeMatchedAndTotalLength(
                             prev: node.prevs[idx],
                             currentWord: node.data.word,
+                            currentNode: node,
                             constraintBytes: constraintBytes,
                             normalizesUnfixedForJinen: normalizesUnfixedForJinen,
-                            fixedByteCount: fixedByteCount
+                            fixedByteCount: fixedByteCount,
+                            segmentCache: &jinenSegmentCache
                         )
                     }
                     let ccLatter = self.dicdataStore.getCCLatter(node.data.rcid)
@@ -474,9 +833,11 @@ extension Kana2Kanji {
                                     matched: matchedPrev,
                                     previousTotal: totalPrev,
                                     nextWord: nextnode.data.word,
+                                    nextNode: nextnode,
                                     constraintBytes: constraintBytes,
                                     normalizesUnfixedForJinen: normalizesUnfixedForJinen,
-                                    fixedByteCount: fixedByteCount
+                                    fixedByteCount: fixedByteCount,
+                                    segmentCache: &jinenSegmentCache
                                 )
                                 if mismatch {
                                     continue
@@ -501,9 +862,11 @@ extension Kana2Kanji {
                                     matched: matchedPrev,
                                     previousTotal: totalPrev,
                                     nextWord: nextnode.data.word,
+                                    nextNode: nextnode,
                                     constraintBytes: constraintBytes,
                                     normalizesUnfixedForJinen: normalizesUnfixedForJinen,
-                                    fixedByteCount: fixedByteCount
+                                    fixedByteCount: fixedByteCount,
+                                    segmentCache: &jinenSegmentCache
                                 )
                                 let newTotal = totalPrev + nextLen
                                 guard self.matchesFixedPrefix(matched: matchedExt, total: newTotal, fixedByteCount: fixedByteCount) else {
